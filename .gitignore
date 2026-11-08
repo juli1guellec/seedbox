@@ -1,0 +1,24 @@
+# Secrets & Environment
+.env
+.env.*
+!.env.example
+
+# Runtime data & state
+data/
+*.db
+*.sqlite
+*.sqlite3
+*cookies.txt
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+
+# OS
+.DS_Store
+Thumbs.db

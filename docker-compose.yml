@@ -1,0 +1,15 @@
+services:
+  seedbox-pilot:
+    build: .
+    container_name: seedbox-pilot
+    restart: unless-stopped
+    ports:
+      - "8100:8080"
+    env_file:
+      - .env
+    volumes:
+      - ./data:/data
+    environment:
+      - TZ=Europe/Paris
+      - DATA_DIR=/data
+      - PORT=8080
