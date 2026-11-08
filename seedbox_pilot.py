@@ -127,7 +127,17 @@ USER_AGENT = (
 
 EVENTS_FILE = os.path.join(DATA_DIR, "pilot_events.jsonl")
 HISTORY_FILE = os.path.join(DATA_DIR, "stats_history.jsonl")
+TELEMETRY_FILE = os.path.join(DATA_DIR, "telemetry.jsonl")
+LEDGER_FILE = os.path.join(DATA_DIR, "torrent_ledger.json")
+LEARNING_FILE = os.path.join(DATA_DIR, "learning_state.json")
 YGG_COOKIE_FILE = os.path.join(DATA_DIR, "ygg_cookies.txt")
+RETENTION_DAYS = int(os.environ.get("RETENTION_DAYS", "30"))
+UNREPAID_DEBT_BRAKE_GB = float(os.environ.get("UNREPAID_DEBT_BRAKE_GB", "12.0"))
+
+BASE_EXCEPT_RELEASES = (
+    "*VOSTFR*,*SUBFRENCH*,*Fansub*,*CAM*,*TS*,*HDTS*,*DVDSCR*,"
+    "*.ts,*_France*,*Essais.Libres*,*Essais.Qualificatifs*"
+)
 
 STATE = {
     "started_at": int(time.time()),
@@ -135,7 +145,15 @@ STATE = {
     "last_pilot_iso": None,
     "last_tracker_ts": 0,
     "last_tracker_iso": None,
+    "last_retention_ts": 0,
     "last_error": None,
+    "logs_retention": {
+        "retention_days": RETENTION_DAYS,
+        "telemetry_count": 0,
+        "history_count": 0,
+        "events_count": 0,
+        "last_cleanup_iso": None,
+    },
     "quota": {
         "used_gb": 0.0,
         "limit_gb": 2000.0,
@@ -183,12 +201,279 @@ STATE = {
     "autobrr": {
         "filters": [],
     },
+    "learning": {
+        "ledger_total_torrents": 0,
+        "mature_torrents_analyzed": 0,
+        "strategy_mode": "CALIBRATION",
+        "unrepaid_dl_debt_6h_gb": 0.0,
+        "debt_brake_active": False,
+        "recommended_max_size": "9GiB",
+        "recommended_max_downloads": 2,
+        "auto_blacklisted_groups": [],
+        "top_groups": [],
+        "by_category": {},
+        "by_size_bucket": {},
+        "super_seed_active_count": 0,
+        "last_updated_iso": None,
+    },
     "recent_events": [],
 }
 
 
 def now_paris_iso():
     return datetime.datetime.now(TZ_PARIS).isoformat(timespec="seconds")
+
+
+def prune_and_count_jsonl(filepath, retention_days=RETENTION_DAYS):
+    """Nettoyage atomique des fichiers .jsonl selon la règle des 30 jours de telemetry-collector."""
+    if not os.path.exists(filepath):
+        return 0
+    cutoff_ts = int(time.time()) - (retention_days * 86400)
+    valid_lines = []
+    dirty = False
+    try:
+        with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                s = line.strip()
+                if not s:
+                    continue
+                try:
+                    rec = json.loads(s)
+                    if rec.get("ts", 0) < cutoff_ts:
+                        dirty = True
+                        continue
+                    valid_lines.append(s)
+                except Exception:
+                    dirty = True
+        if dirty:
+            tmp_path = filepath + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                for s in valid_lines:
+                    f.write(s + "\n")
+            os.replace(tmp_path, filepath)
+    except Exception:
+        pass
+    return len(valid_lines)
+
+
+def run_retention_cleanup():
+    t_cnt = prune_and_count_jsonl(TELEMETRY_FILE, RETENTION_DAYS)
+    h_cnt = prune_and_count_jsonl(HISTORY_FILE, RETENTION_DAYS)
+    e_cnt = prune_and_count_jsonl(EVENTS_FILE, RETENTION_DAYS)
+    STATE["logs_retention"] = {
+        "retention_days": RETENTION_DAYS,
+        "telemetry_count": t_cnt,
+        "history_count": h_cnt,
+        "events_count": e_cnt,
+        "last_cleanup_iso": now_paris_iso(),
+    }
+    STATE["last_retention_ts"] = int(time.time())
+
+
+# ─── Moteur d'Auto-Apprentissage & d'Auto-Adaptation (RatioLearner) ──────────
+def extract_torrent_features(name, size_gb, tags=""):
+    n = name or ""
+    n_low = n.lower()
+    t_low = (tags or "").lower()
+    is_fl = "freeleech" in t_low
+
+    # 1. Classification du type de contenu
+    if n_low.endswith(".ts") or "_france " in n_low or "_arte_" in n_low:
+        content_type = "tv_raw_ts"
+    elif any(k in n_low for k in ("formula.1", "essais.libres", "essais.qualificatifs", "motogp", "ufc.")):
+        content_type = "sport_event"
+    elif re.search(r"\bs\d{1,2}e\d{1,3}\b", n_low):
+        content_type = "episode_tv"
+    elif re.search(r"\b(s\d{1,2}|saison\s*\d+)\b", n_low):
+        content_type = "season_pack"
+    elif "2160p" in n_low or "4k" in n_low:
+        content_type = "movie_4k"
+    elif "1080p" in n_low:
+        content_type = "movie_1080p"
+    else:
+        content_type = "other"
+
+    # 2. Tranche de taille
+    if size_gb < 2.0:
+        size_bucket = "S (<2 Go)"
+    elif size_gb < 6.0:
+        size_bucket = "M (2-6 Go)"
+    elif size_gb < 12.0:
+        size_bucket = "L (6-12 Go)"
+    else:
+        size_bucket = "XL (>12 Go)"
+
+    # 3. Extraction de la Team / Release Group
+    stem = re.sub(r"\.(mkv|mp4|avi|ts|iso)$", "", n, flags=re.IGNORECASE)
+    m_grp = re.search(r"-([A-Za-z0-9_]{2,15})$", stem)
+    release_group = m_grp.group(1).upper() if m_grp else "UNKNOWN"
+
+    return {
+        "content_type": content_type,
+        "size_bucket": size_bucket,
+        "release_group": release_group,
+        "is_freeleech": is_fl,
+    }
+
+
+def update_learning_engine(enriched_torrents, now_ts):
+    ledger = {}
+    if os.path.exists(LEDGER_FILE):
+        try:
+            with open(LEDGER_FILE, "r", encoding="utf-8") as f:
+                ledger = json.load(f)
+        except Exception:
+            ledger = {}
+
+    # Mettre à jour le registre persistant avec les torrents actifs
+    for t in enriched_torrents:
+        h = t["hash"]
+        feats = extract_torrent_features(t["name"], t["size_gb"], t.get("tags", ""))
+        t["content_type"] = feats["content_type"]
+        t["size_bucket"] = feats["size_bucket"]
+        t["release_group"] = feats["release_group"]
+        t["is_freeleech"] = feats["is_freeleech"]
+
+        prev = ledger.get(h, {})
+        ledger[h] = {
+            "hash": h,
+            "name": t["name"],
+            "tracker": t["tracker"],
+            "size_gb": t["size_gb"],
+            "uploaded_gb": max(t["uploaded_gb"], prev.get("uploaded_gb", 0.0)),
+            "downloaded_gb": max(t["downloaded_gb"], prev.get("downloaded_gb", t["size_gb"])),
+            "ratio": max(t["ratio"], prev.get("ratio", 0.0)),
+            "seed_hours": max(t["seed_hours"], prev.get("seed_hours", 0.0)),
+            "added_on": t.get("added_on", prev.get("added_on", now_ts)),
+            "last_seen_ts": now_ts,
+            "content_type": feats["content_type"],
+            "size_bucket": feats["size_bucket"],
+            "release_group": feats["release_group"],
+            "is_freeleech": feats["is_freeleech"] or prev.get("is_freeleech", False),
+        }
+
+    # Sauvegarder le ledger (en gardant les 1000 derniers torrents max)
+    if len(ledger) > 1000:
+        sorted_keys = sorted(ledger.keys(), key=lambda k: ledger[k].get("last_seen_ts", 0), reverse=True)[:1000]
+        ledger = {k: ledger[k] for k in sorted_keys}
+    try:
+        tmp_l = LEDGER_FILE + ".tmp"
+        with open(tmp_l, "w", encoding="utf-8") as f:
+            json.dump(ledger, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_l, LEDGER_FILE)
+    except Exception:
+        pass
+
+    # Analyser tous les torrents ayant au moins 2h de recul
+    mature = [v for v in ledger.values() if v.get("seed_hours", 0) >= 2.0 and v.get("size_gb", 0) > 0.05]
+
+    def _agg_bucket(items, key_name):
+        buckets = {}
+        for item in items:
+            k = item.get(key_name, "other")
+            b = buckets.setdefault(k, {"count": 0, "up_gb": 0.0, "dl_gb": 0.0, "paid_dl_gb": 0.0, "wins": 0, "seed_h": 0.0})
+            b["count"] += 1
+            b["up_gb"] += item["uploaded_gb"]
+            b["dl_gb"] += item["size_gb"]
+            if not item.get("is_freeleech"):
+                b["paid_dl_gb"] += item["size_gb"]
+            if item["ratio"] >= 0.85 or item.get("is_freeleech"):
+                b["wins"] += 1
+            b["seed_h"] += max(1.0, item["seed_hours"])
+        out = {}
+        for k, b in buckets.items():
+            roi = round(b["up_gb"] / max(0.1, b["dl_gb"]), 2)
+            net_buf = round(b["up_gb"] - b["paid_dl_gb"], 2)
+            win_rate = round((b["wins"] / b["count"]) * 100.0, 1) if b["count"] else 0.0
+            # Multiplicateur de rentabilité appris (entre 0.3 et 2.2)
+            mult = round(max(0.3, min(2.2, roi * 1.15)), 2)
+            out[k] = {
+                "count": b["count"],
+                "up_gb": round(b["up_gb"], 2),
+                "dl_gb": round(b["dl_gb"], 2),
+                "net_buffer_gb": net_buf,
+                "roi": roi,
+                "win_rate_pct": win_rate,
+                "learned_weight": mult,
+            }
+        return out
+
+    by_cat = _agg_bucket(mature, "content_type")
+    by_size = _agg_bucket(mature, "size_bucket")
+    by_grp = _agg_bucket([x for x in mature if x.get("seed_hours", 0) >= 5.0], "release_group")
+
+    # Identifier les Release Groups déficitaires à blacklister sur les filtres payants
+    auto_blacklisted = []
+    for grp, st in by_grp.items():
+        if grp in ("UNKNOWN", "NOTAG"):
+            continue
+        if st["count"] >= 2 and st["roi"] < 0.45 and st["net_buffer_gb"] <= -2.5:
+            auto_blacklisted.append(grp)
+
+    top_groups = sorted(
+        [{"group": g, **st} for g, st in by_grp.items() if g != "UNKNOWN"],
+        key=lambda x: (x["net_buffer_gb"], x["roi"]),
+        reverse=True,
+    )[:8]
+
+    # Calibrer dynamiquement la taille max des filtres payants selon le ROI de XL (>12 Go) et L (6-12 Go)
+    xl_stats = by_size.get("XL (>12 Go)", {})
+    l_stats = by_size.get("L (6-12 Go)", {})
+    if xl_stats.get("count", 0) >= 1 and xl_stats.get("net_buffer_gb", 0) <= -4.0 and xl_stats.get("roi", 1.0) < 0.75:
+        if l_stats.get("win_rate_pct", 0.0) >= 60.0 or l_stats.get("roi", 1.0) >= 0.72:
+            rec_max_size = "8GiB"
+        else:
+            rec_max_size = "6GiB"
+    else:
+        rec_max_size = "14GiB"
+
+    # Calculer la "dette de download non remboursée" sur les 6 dernières heures (Frein Anti-Dilution)
+    unrepaid_6h = 0.0
+    for t in enriched_torrents:
+        age_h = max(0.0, (now_ts - t.get("added_on", now_ts)) / 3600.0)
+        if age_h <= 6.0 and not t.get("is_freeleech"):
+            debt = max(0.0, t["size_gb"] - t["uploaded_gb"])
+            unrepaid_6h += debt
+    unrepaid_6h = round(unrepaid_6h, 2)
+    debt_brake = unrepaid_6h >= UNREPAID_DEBT_BRAKE_GB
+
+    if debt_brake:
+        strategy_mode = "AMORTISSEMENT_SWARM (Pause DL payant, Freeleech 100%)"
+        rec_max_dl = 1
+    elif unrepaid_6h >= 6.0:
+        strategy_mode = "PRUDENT (1 Hit/h + Freeleech)"
+        rec_max_dl = 1
+    elif unrepaid_6h < 2.5 and (STATE["trackers"]["yggreborn"].get("ratio") or 1.4) >= 1.35:
+        strategy_mode = "OFFENSIF_CALIBRÉ (2 Hits ≤" + rec_max_size + "/h + Freeleech)"
+        rec_max_dl = 2
+    else:
+        strategy_mode = "CROISIÈRE_OPTIMISÉE"
+        rec_max_dl = 2
+
+    learning_summary = {
+        "ledger_total_torrents": len(ledger),
+        "mature_torrents_analyzed": len(mature),
+        "strategy_mode": strategy_mode,
+        "unrepaid_dl_debt_6h_gb": unrepaid_6h,
+        "debt_brake_active": debt_brake,
+        "recommended_max_size": rec_max_size,
+        "recommended_max_downloads": rec_max_dl,
+        "auto_blacklisted_groups": sorted(auto_blacklisted),
+        "top_groups": top_groups,
+        "by_category": by_cat,
+        "by_size_bucket": by_size,
+        "super_seed_active_count": STATE["learning"].get("super_seed_active_count", 0),
+        "last_updated_iso": now_paris_iso(),
+    }
+    STATE["learning"] = learning_summary
+    try:
+        tmp_s = LEARNING_FILE + ".tmp"
+        with open(tmp_s, "w", encoding="utf-8") as f:
+            json.dump(learning_summary, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_s, LEARNING_FILE)
+    except Exception:
+        pass
+    return learning_summary
 
 
 def log_event(category, message, details=None):
@@ -294,20 +579,48 @@ AUTOBRR_ARRAY_FIELDS = [
 ]
 
 
-def set_autobrr_filter_enabled(filter_id, enabled, reason):
+def set_autobrr_filter_enabled(
+    filter_id,
+    enabled,
+    reason,
+    desired_max_size=None,
+    desired_max_downloads=None,
+    desired_except_releases=None,
+):
     f = autobrr_request(f"/api/filters/{filter_id}", "GET")
-    if not f or bool(f.get("enabled")) == bool(enabled):
+    if not f:
         return False
+
+    changed_fields = []
+    if bool(f.get("enabled")) != bool(enabled):
+        f["enabled"] = bool(enabled)
+        changed_fields.append(f"enabled={'ACTIVÉ' if enabled else 'PAUSÉ'}")
+
+    if desired_max_size and f.get("max_size") != desired_max_size:
+        old_sz = f.get("max_size")
+        f["max_size"] = desired_max_size
+        changed_fields.append(f"max_size={old_sz}->{desired_max_size}")
+
+    if desired_max_downloads is not None and int(f.get("max_downloads", 0)) != int(desired_max_downloads):
+        old_dl = f.get("max_downloads")
+        f["max_downloads"] = int(desired_max_downloads)
+        changed_fields.append(f"max_downloads={old_dl}->{desired_max_downloads}/h")
+
+    if desired_except_releases and f.get("except_releases") != desired_except_releases:
+        f["except_releases"] = desired_except_releases
+        changed_fields.append("except_releases=auto_learned")
+
+    if not changed_fields:
+        return False
+
     for k in AUTOBRR_ARRAY_FIELDS:
         if f.get(k) is None:
             f[k] = []
-    f["enabled"] = bool(enabled)
     autobrr_request(f"/api/filters/{filter_id}", "PUT", f)
-    state_str = "ACTIVÉ" if enabled else "PAUSÉ"
     log_event(
-        "AUTOBRR",
-        f"Filtre '{f.get('name')}' (#{filter_id}) {state_str} — {reason}",
-        {"filter_id": filter_id, "enabled": enabled, "reason": reason},
+        "AUTOBRR_ADAPT",
+        f"Filtre '{f.get('name')}' (#{filter_id}) auto-adapté ({', '.join(changed_fields)}) — {reason}",
+        {"filter_id": filter_id, "changes": changed_fields, "reason": reason},
     )
     return True
 
@@ -489,24 +802,36 @@ def is_hnr_safe_to_delete(t_info, tracker_key):
     return seed_hours >= 72.0
 
 
-def compute_profitability_score(t_info):
+def compute_profitability_score(t_info, tracker_key="other"):
     """
-    Score de rentabilité d'un torrent en seed :
-    Plus le score est bas, plus le torrent est candidat à l'éviction si le disque est plein.
+    Score de rentabilité auto-adaptatif d'un torrent en seed :
+    Intègre le rendement horaire par Go, la vitesse instantanée, les leechers,
+    le poids appris de sa catégorie (RatioLearner) et un bonus de protection C411 (Zen).
     """
     size_gb = max(0.1, t_info["size"] / (1024 ** 3))
     up_gb = t_info["uploaded"] / (1024 ** 3)
     seed_hours = max(1.0, t_info["seeding_time"] / 3600.0)
     up_speed_kb = t_info.get("upspeed", 0) / 1024.0
     leechers = max(0, t_info.get("num_incomplete", 0))
-    # Upload horaire par Go de disque occupé + bonus vitesse active + bonus leechers
     hourly_roi = (up_gb / size_gb) / seed_hours
-    return round(hourly_roi * 1000.0 + up_speed_kb * 0.5 + leechers * 2.0, 3)
+    base_score = hourly_roi * 1000.0 + up_speed_kb * 0.5 + leechers * 2.5
+
+    feats = extract_torrent_features(t_info.get("name", ""), size_gb, t_info.get("tags", ""))
+    cat_stats = STATE.get("learning", {}).get("by_category", {}).get(feats["content_type"], {})
+    cat_weight = float(cat_stats.get("learned_weight", 1.0))
+
+    # Bonus de protection C411 (+150%) pour maximiser la génération de points Zen
+    tracker_mult = 2.5 if tracker_key == "c411" else 1.0
+    return round(base_score * cat_weight * tracker_mult, 3)
 
 
 def run_pilot_cycle():
     now_ts = int(time.time())
     now_iso = now_paris_iso()
+
+    # Nettoyage automatique des logs > 30 jours toutes les 6h (discipline telemetry-collector)
+    if now_ts - STATE.get("last_retention_ts", 0) >= 6 * 3600:
+        run_retention_cleanup()
 
     # 1. Vérifier/appliquer les préférences qBittorrent (Anti-sabotage)
     prefs = QBIT.request("/api/v2/app/preferences")
@@ -534,6 +859,8 @@ def run_pilot_cycle():
 
     to_delete_hashes = []
     unlimited_hashes = []
+    super_seed_enable = []
+    super_seed_disable = []
     c411_forbidden_dl_detected = False
 
     by_tracker = {
@@ -595,6 +922,17 @@ def run_pilot_cycle():
         if t.get("ratio_limit", -2) != -2 or t.get("seeding_time_limit", -2) != -2:
             unlimited_hashes.append(h)
 
+        # Swarm Boost : Super Seeding uniquement si seeder initial (<=2 seeds et >=2 leechers connectés)
+        leechs_cnt = t.get("num_incomplete", 0)
+        connected_leechs = t.get("num_leechs", 0)
+        seeds_cnt = t.get("num_complete", 0)
+        cur_super = bool(t.get("super_seeding", False))
+        want_super = prog >= 1.0 and seeds_cnt <= 2 and connected_leechs >= 2 and t.get("ratio", 0.0) < 1.5
+        if want_super and not cur_super:
+            super_seed_enable.append(h)
+        elif not want_super and cur_super:
+            super_seed_disable.append(h)
+
         # Statistiques par tracker
         if t_key in by_tracker:
             by_tracker[t_key]["count"] += 1
@@ -604,7 +942,7 @@ def run_pilot_cycle():
 
         seed_h = round(t.get("seeding_time", 0) / 3600.0, 1)
         hnr_safe = is_hnr_safe_to_delete(t, t_key)
-        score = compute_profitability_score(t)
+        score = compute_profitability_score(t, t_key)
         min_h = C411_MIN_SEED_HOURS if t_key == "c411" else YGG_MIN_SEED_HOURS
 
         enriched_torrents.append({
@@ -623,12 +961,13 @@ def run_pilot_cycle():
             "hnr_safe": hnr_safe,
             "score": score,
             "seeds": t.get("num_complete", 0),
-            "leechs": t.get("num_incomplete", 0),
+            "leechs": leechs_cnt,
+            "super_seeding": want_super,
             "tags": t.get("tags", ""),
             "added_on": added_on,
         })
 
-    # Appliquer les nettoyages qBittorrent
+    # Appliquer les nettoyages et optimisations qBittorrent
     if to_delete_hashes:
         hashes_str = "|".join(x[0] for x in to_delete_hashes)
         QBIT.request("/api/v2/torrents/delete", {"hashes": hashes_str, "deleteFiles": "true"})
@@ -646,6 +985,15 @@ def run_pilot_cycle():
             },
         )
         log_event("QBIT_LIMITS", f"Limites de ratio désactivées sur {len(unlimited_hashes)} torrents")
+
+    if super_seed_enable:
+        QBIT.request("/api/v2/torrents/setSuperSeeding", {"hashes": "|".join(super_seed_enable), "value": "true"})
+    if super_seed_disable:
+        QBIT.request("/api/v2/torrents/setSuperSeeding", {"hashes": "|".join(super_seed_disable), "value": "false"})
+    STATE["learning"]["super_seed_active_count"] = sum(1 for x in enriched_torrents if x.get("super_seeding"))
+
+    # 2b. Exécuter le moteur d'Auto-Apprentissage & calcul du ROI par catégorie/taille/team
+    learned = update_learning_engine(enriched_torrents, now_ts)
 
     # 3. Garbage Collection Intelligent si le disque dépasse DISK_HIGH_WATERMARK_PCT (82%)
     used_pct = STATE["quota"]["used_pct"]
@@ -688,11 +1036,19 @@ def run_pilot_cycle():
         STATE["last_tracker_ts"] = now_ts
         STATE["last_tracker_iso"] = now_iso
 
-    # 5. Pilotage Dynamique des Filtres Autobrr
+    # 5. Pilotage Dynamique & Auto-Adaptation des Filtres Autobrr
     if AUTOBRR_API_KEY:
         try:
             disk_emergency = STATE["quota"]["used_pct"] >= DISK_EMERGENCY_STOP_PCT
-            ygg_ratio = STATE["trackers"]["yggreborn"].get("ratio") or 1.39
+            ygg_ratio = STATE["trackers"]["yggreborn"].get("ratio") or 1.40
+
+            # Construire la liste d'exclusions apprises (Base + Teams déficitaires détectées)
+            extra_excepts = [f"*-{grp}*" for grp in learned.get("auto_blacklisted_groups", [])]
+            adaptive_except = BASE_EXCEPT_RELEASES + ("," + ",".join(extra_excepts) if extra_excepts else "")
+            adaptive_max_size = learned.get("recommended_max_size", "9GiB")
+            adaptive_max_dl = learned.get("recommended_max_downloads", 2)
+            debt_brake = learned.get("debt_brake_active", False)
+            unrepaid_6h = learned.get("unrepaid_dl_debt_6h_gb", 0.0)
 
             # Filtres Freeleech : toujours actifs sauf urgence disque (>92%)
             set_autobrr_filter_enabled(
@@ -706,15 +1062,28 @@ def run_pilot_cycle():
                 "Urgence disque >92%" if disk_emergency else "Freeleech C411 actif (0 risque ratio)",
             )
 
-            # Filtre YGG - 2026 Hits FR/MULTi : actif si ratio YGG >= 1.10 et disque < 88%
-            ygg_paid_ok = (not disk_emergency) and (STATE["quota"]["used_pct"] < 88.0) and (ygg_ratio >= YGG_MIN_RATIO_FOR_PAID)
+            # Filtre YGG - 2026 Hits FR/MULTi : piloté par Ratio + Disque + Frein Anti-Dilution + Calibration Taille/Teams
+            ygg_paid_ok = (
+                (not disk_emergency)
+                and (STATE["quota"]["used_pct"] < 88.0)
+                and (ygg_ratio >= YGG_MIN_RATIO_FOR_PAID)
+                and (not debt_brake)
+            )
+            ygg_reason = (
+                f"Frein Anti-Dilution actif (dette 6h={unrepaid_6h}Go ≥ {UNREPAID_DEBT_BRAKE_GB}Go)"
+                if debt_brake
+                else f"Ratio YGG={ygg_ratio}, MaxSize={adaptive_max_size}, Excl={len(extra_excepts)} teams"
+            )
             set_autobrr_filter_enabled(
                 FILTER_ID_YGG_PAID,
                 ygg_paid_ok,
-                f"Ratio YGG={ygg_ratio} (seuil {YGG_MIN_RATIO_FOR_PAID}), Disque={STATE['quota']['used_pct']}%",
+                ygg_reason,
+                desired_max_size=adaptive_max_size,
+                desired_max_downloads=adaptive_max_dl,
+                desired_except_releases=adaptive_except,
             )
 
-            # Filtre C411 - 2026 Hits FR/MULTi : actif uniquement si C411 autorise le DL et pas de 403 Forbidden récent
+            # Filtre C411 - 2026 Hits FR/MULTi : actif uniquement si C411 autorise le DL, pas de 403 et dette 6h OK
             c411_allowed = STATE["trackers"]["c411"].get("download_allowed")
             c411_ratio = STATE["trackers"]["c411"].get("ratio")
             c411_paid_ok = (
@@ -722,11 +1091,15 @@ def run_pilot_cycle():
                 and (not c411_forbidden_dl_detected)
                 and (c411_allowed is True)
                 and (c411_ratio is not None and c411_ratio >= C411_MIN_RATIO_FOR_PAID)
+                and (not debt_brake)
             )
             set_autobrr_filter_enabled(
                 FILTER_ID_C411_PAID,
                 c411_paid_ok,
                 "Récupération ratio C411 en cours (seed + Zen)" if not c411_paid_ok else f"Ratio C411={c411_ratio} OK",
+                desired_max_size=adaptive_max_size,
+                desired_max_downloads=adaptive_max_dl,
+                desired_except_releases=adaptive_except,
             )
 
             filters_list = autobrr_request("/api/filters", "GET") or []
@@ -736,6 +1109,7 @@ def run_pilot_cycle():
                     "name": fl.get("name"),
                     "enabled": fl.get("enabled"),
                     "priority": fl.get("priority"),
+                    "max_size": fl.get("max_size"),
                     "max_downloads": f"{fl.get('max_downloads', 0)}/{fl.get('max_downloads_unit', 'HOUR')}",
                 }
                 for fl in filters_list
@@ -762,26 +1136,57 @@ def run_pilot_cycle():
     STATE["last_pilot_iso"] = now_iso
     STATE["last_error"] = None
 
-    # Sauvegarder un point d'historique toutes les heures
+    # 6. Sauvegarder la télémétrie structurée (compatible telemetry-collector, rétention 30j)
     try:
-        hist_point = {
+        telemetry_point = {
             "ts": now_ts,
             "iso": now_iso,
-            "ygg_ratio": STATE["trackers"]["yggreborn"].get("ratio"),
-            "ygg_up_tb": STATE["trackers"]["yggreborn"].get("upload_tb"),
-            "c411_qbit_up_gb": by_tracker["c411"]["up_gb"],
-            "disk_used_gb": STATE["quota"]["used_gb"],
-            "torrents_count": len(enriched_torrents),
+            "ygg": {
+                "ratio": STATE["trackers"]["yggreborn"].get("ratio"),
+                "up_tb": STATE["trackers"]["yggreborn"].get("upload_tb"),
+                "dl_tb": STATE["trackers"]["yggreborn"].get("download_tb"),
+                "fl_tb": STATE["trackers"]["yggreborn"].get("freeleech_tb"),
+                "buffer_gb": STATE["trackers"]["yggreborn"].get("buffer_gb"),
+                "qbit_up_gb": by_tracker["yggreborn"]["up_gb"],
+                "qbit_count": by_tracker["yggreborn"]["count"],
+            },
+            "c411": {
+                "ratio": STATE["trackers"]["c411"].get("ratio") or STATE["trackers"]["c411"].get("qbit_ratio"),
+                "qbit_up_gb": by_tracker["c411"]["up_gb"],
+                "qbit_dl_gb": by_tracker["c411"]["dl_gb"],
+                "qbit_count": by_tracker["c411"]["count"],
+                "zen": STATE["trackers"]["c411"].get("zen_balance"),
+            },
+            "disk": STATE["quota"],
+            "learning": {
+                "mode": learned.get("strategy_mode"),
+                "unrepaid_6h_gb": learned.get("unrepaid_dl_debt_6h_gb"),
+                "max_size": learned.get("recommended_max_size"),
+                "blacklisted_groups": learned.get("auto_blacklisted_groups"),
+            },
         }
+        with open(TELEMETRY_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(telemetry_point, ensure_ascii=False) + "\n")
         with open(HISTORY_FILE, "a", encoding="utf-8") as f:
-            f.write(json.dumps(hist_point) + "\n")
+            f.write(json.dumps({
+                "ts": now_ts,
+                "iso": now_iso,
+                "ygg_ratio": telemetry_point["ygg"]["ratio"],
+                "ygg_up_tb": telemetry_point["ygg"]["up_tb"],
+                "c411_qbit_up_gb": by_tracker["c411"]["up_gb"],
+                "disk_used_gb": STATE["quota"]["used_gb"],
+                "torrents_count": len(enriched_torrents),
+            }) + "\n")
+        STATE["logs_retention"]["telemetry_count"] += 1
+        STATE["logs_retention"]["history_count"] += 1
     except Exception:
         pass
 
 
 def pilot_loop():
+    run_retention_cleanup()
     load_recent_events()
-    log_event("STARTUP", "Seedbox Pilot démarré (Cycle qBittorrent=5m, Trackers=30m anti-ban)")
+    log_event("STARTUP", "Seedbox Pilot démarré avec Auto-Apprentissage ROI & Rétention Logs 30j")
     while True:
         try:
             run_pilot_cycle()
@@ -905,6 +1310,23 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     </div>
   </div>
 
+  <div class="grid" style="grid-template-columns: repeat(auto-fit, minmax(420px, 1fr));">
+    <div class="card">
+      <h2>🧠 Moteur d'Auto-Apprentissage & Auto-Adaptation (RatioLearner)</h2>
+      <div class="metric-row"><span>Mode Stratégique Actif</span><strong id="learn-mode" style="color:var(--emerald)">--</strong></div>
+      <div class="metric-row"><span>Mémoire d'Apprentissage (Torrents)</span><strong id="learn-count">--</strong></div>
+      <div class="metric-row"><span>Dette Download 6h (Frein ≥12 Go)</span><strong id="learn-debt">--</strong></div>
+      <div class="metric-row"><span>Plafond Taille Auto-Calibré (Payant)</span><strong id="learn-maxsize" style="color:var(--sky)">--</strong></div>
+      <div class="metric-row"><span>Teams Auto-Blacklistées (ROI &lt; 0.45)</span><strong id="learn-bl" style="color:var(--rose)">--</strong></div>
+      <div class="metric-row"><span>Rétention Logs (30 jours)</span><span id="learn-ret" style="color:var(--muted)">--</span></div>
+    </div>
+
+    <div class="card">
+      <h2>📈 Rentabilité Apprise par Catégorie & Tranche de Taille</h2>
+      <div id="learn-buckets"></div>
+    </div>
+  </div>
+
   <div class="card" style="margin-bottom:20px;">
     <h2>📦 Torrents Actifs sur Ultra.cc (<span id="torrents-count">0</span>) — Triés par Rentabilité & Protection H&R</h2>
     <div style="overflow-x:auto;">
@@ -969,10 +1391,41 @@ async function loadStatus() {
       '⬆️ ' + (s.qbit.up_speed_mb || 0) + ' Mo/s  |  ⬇️ ' + (s.qbit.dl_speed_mb || 0) + ' Mo/s';
 
     const flHtml = (s.autobrr.filters || []).map(f =>
-      '<div class="metric-row"><span>' + f.name + ' <small style="color:var(--muted)">(' + f.max_downloads + ')</small></span>' +
+      '<div class="metric-row"><span>' + f.name + ' <small style="color:var(--muted)">(' + f.max_downloads + (f.max_size ? ', ≤' + f.max_size : '') + ')</small></span>' +
       '<span class="badge ' + (f.enabled ? 'badge-ok' : 'badge-warn') + '">' + (f.enabled ? 'ACTIF' : 'PAUSÉ') + '</span></div>'
     ).join('');
     document.getElementById('filters-list').innerHTML = flHtml || '<div style="color:var(--muted)">Aucun filtre</div>';
+
+    const lrn = s.learning || {};
+    const ret = s.logs_retention || {};
+    document.getElementById('learn-mode').textContent = lrn.strategy_mode || '--';
+    document.getElementById('learn-count').textContent =
+      (lrn.mature_torrents_analyzed || 0) + ' analysés / ' + (lrn.ledger_total_torrents || 0) + ' en mémoire';
+    document.getElementById('learn-debt').textContent =
+      (lrn.unrepaid_dl_debt_6h_gb || 0) + ' Go ' + (lrn.debt_brake_active ? '🛑 FREIN ACTIF' : '✅ OK');
+    document.getElementById('learn-maxsize').textContent =
+      (lrn.recommended_max_size || '9GiB') + ' (' + (lrn.recommended_max_downloads || 2) + '/h)';
+    document.getElementById('learn-bl').textContent =
+      (lrn.auto_blacklisted_groups && lrn.auto_blacklisted_groups.length)
+        ? lrn.auto_blacklisted_groups.join(', ')
+        : 'Aucune (0)';
+    document.getElementById('learn-ret').textContent =
+      'Purge auto 30j (' + (ret.telemetry_count || 0) + ' pts télémétrie)';
+
+    const catEntries = Object.entries(lrn.by_category || {});
+    const szEntries = Object.entries(lrn.by_size_bucket || {});
+    const bucketRows = [
+      ...catEntries.map(([k, v]) => ({label: 'Cat: ' + k, ...v})),
+      ...szEntries.map(([k, v]) => ({label: 'Taille: ' + k, ...v})),
+    ];
+    document.getElementById('learn-buckets').innerHTML = bucketRows.map(b => {
+      const col = b.roi >= 0.85 ? 'var(--emerald)' : (b.roi >= 0.5 ? 'var(--amber)' : 'var(--rose)');
+      const sign = b.net_buffer_gb >= 0 ? '+' : '';
+      return '<div class="metric-row">' +
+        '<span>' + b.label + ' <small style="color:var(--muted)">(' + b.count + ' torrents)</small></span>' +
+        '<strong style="color:' + col + '">ROI ' + b.roi + 'x (' + sign + b.net_buffer_gb + ' Go)</strong>' +
+      '</div>';
+    }).join('') || '<div style="color:var(--muted)">Collecte en cours...</div>';
 
     const torrents = s.qbit.torrents || [];
     document.getElementById('torrents-count').textContent = torrents.length;
@@ -1032,7 +1485,14 @@ class PilotHTTPHandler(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/healthz":
-            self._send_json(200, {"ok": True, "last_pilot_ts": STATE["last_pilot_ts"]})
+            self._send_json(200, {
+                "ok": True,
+                "last_pilot_ts": STATE["last_pilot_ts"],
+                "logs_retention": STATE["logs_retention"],
+                "strategy_mode": STATE["learning"].get("strategy_mode"),
+            })
+        elif self.path.startswith("/api/learning"):
+            self._send_json(200, STATE["learning"])
         elif self.path.startswith("/api/status"):
             self._send_json(200, STATE)
         else:

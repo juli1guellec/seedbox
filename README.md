@@ -71,8 +71,20 @@ flowchart LR
 - **Sous 82 % d'occupation disque (`< 1527 Go`)** : **Aucune suppression**. Plus vous gardez de torrents en seed simultané, plus vous gagnez d'upload long-terme et de points Zen.
 - **Au-dessus de 82 % d'occupation disque** : `seedbox-pilot` libère de la place jusqu'à redescendre à **75 %** en supprimant **uniquement** les torrents qui :
   1. Ont **validé leur obligation Hit & Run** (`>= 74h` de seed ou `ratio >= 2.1` sur C411 / `>= 1.5` sur YGG).
-  2. Ont le **score de rentabilité** le plus faible :
-     $$\text{Score} = \frac{\text{Upload (Go)}}{\text{Taille (Go)} \times \max(\text{Heures de Seed}, 6)} + (\text{Pairs actifs} \times 0.25)$$
+  2. Ont le **score de rentabilité auto-adaptatif** le plus faible (pondéré par le poids appris de la catégorie et un bonus $\times 2.5$ pour protéger les torrents C411 générateurs de Zen).
+
+### 3. 🧠 Moteur d'Auto-Apprentissage & d'Auto-Adaptation (`RatioLearner`)
+À chaque cycle de 5 minutes (sans aucune requête supplémentaire vers les trackers), `seedbox-pilot` enrichit une mémoire persistante (`torrent_ledger.json` + `learning_state.json`) et adapte automatiquement la stratégie :
+1. **Profilage ROI par Catégorie, Tranche de Taille et Team (`Release Group`)** :
+   - Mesure le ROI réel ($\text{Upload} / \text{Download}$), le gain net de buffer ($\text{UP} - \text{DL}_{\text{payant}}$) et le taux de succès ($\text{ratio} \ge 0.85$) pour chaque segment (`movie_1080p`, `episode_tv`, `season_pack`, `movie_4k`, `sport_event`, `tv_raw_ts`).
+2. **Auto-Blacklist des Teams & Formats Déficitaires (`except_releases`)** :
+   - Toute Team ayant $\ge 2$ torrents matures ($\ge 5\text{h}$ de seed) avec un $\text{ROI} < 0.45$ et une perte nette de buffer $\le -2.5\text{ Go}$ (ex. `*-T3KASHI*`, captures TV `*.ts`, `*Essais.Libres*`) est **automatiquement ajoutée aux exclusions** des filtres payants Autobrr (`#2` et `#3`), tout en restant autorisée sur les filtres `Freeleech` (`#6` et `#7`).
+3. **Auto-Calibration du Plafond de Taille (`max_size`)** :
+   - Ajuste dynamiquement `max_size` sur les filtres payants (`8GiB`, `9GiB`, `14GiB`) selon la rentabilité mesurée des gros fichiers `> 12 Go` vs `6-12 Go`.
+4. **Frein Anti-Dilution en Temps Réel (`unrepaid_dl_debt_6h_gb`)** :
+   - Calcule la dette de download non encore remboursée sur les torrents payants des 6 dernières heures. Si cette dette dépasse `12 Go`, les filtres payants passent automatiquement en pause le temps que l'essaim rembourse le download, laissant les filtres **Freeleech** tourner à 100 %.
+5. **Rétention & Nettoyage Strict des Logs (`RETENTION_DAYS=30`)** :
+   - Sur le modèle exact de `telemetry-collector`, `prune_and_count_jsonl()` purge automatiquement au démarrage et toutes les 6h les entrées de plus de 30 jours dans `telemetry.jsonl`, `stats_history.jsonl` et `pilot_events.jsonl`.
 
 ---
 
@@ -81,7 +93,8 @@ flowchart LR
 Le conteneur expose un tableau de bord temps réel Dark Mode et une API REST :
 - **Dashboard Web** : `http://192.168.0.4:8100/`
 - **État complet JSON** : `http://192.168.0.4:8100/api/status`
-- **Healthcheck Docker** : `http://192.168.0.4:8100/healthz`
+- **État du moteur d'apprentissage** : `http://192.168.0.4:8100/api/learning`
+- **Healthcheck Docker & Rétention Logs** : `http://192.168.0.4:8100/healthz`
 - **Cycle immédiat (POST)** : `curl -X POST http://192.168.0.4:8100/api/run`
 
 ---

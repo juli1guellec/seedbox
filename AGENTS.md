@@ -41,9 +41,12 @@ Ce document contient tout le contexte technique, l'architecture et les **Règles
 ### 2. Démon `seedbox_pilot.py` (Homelab Stack `antigravity`)
 - Écrit en **Python 3.12 standard library pure** (zéro dépendance externe requise, démarre instantanément dans `python:3.12-alpine`).
 - **Port** : `8080` à l'intérieur du conteneur, mappé sur **`8100`** sur l'hôte Homelab (`http://192.168.0.4:8100`).
-- **Fichiers d'état persistants (`DATA_DIR=/data`, mappé sur `/appdata/antigravity/seedbox`)** :
-  - `pilot_events.jsonl` : Journal horodaté des actions automatiques (nettoyage, bascule de filtre, etc.).
-  - `stats_history.jsonl` : Historique périodique du ratio, de l'upload et de l'espace disque.
+- **Fichiers d'état persistants (`DATA_DIR=/data/seedbox`, mappé sur `/appdata/antigravity/seedbox`)** :
+  - `telemetry.jsonl` : Télémétrie haute fidélité à chaque cycle (purgée automatiquement à 30 jours via `prune_and_count_jsonl()`).
+  - `pilot_events.jsonl` : Journal horodaté des actions automatiques (purgé automatiquement à 30 jours).
+  - `stats_history.jsonl` : Historique périodique du ratio, de l'upload et de l'espace disque (purgé automatiquement à 30 jours).
+  - `torrent_ledger.json` : Mémoire d'apprentissage persistante des torrents (jusqu'à 1000 torrents mémorisés même après éviction disque).
+  - `learning_state.json` : Dernier état calculé par le moteur d'auto-apprentissage `RatioLearner` (ROI par catégorie/taille/team, teams auto-blacklistées, plafond `max_size` calibré, frein anti-dilution 6h).
   - `ygg_cookies.txt` : Cookie de session YGGreborn persisté pour éviter les reconnexions inutiles.
 
 ---
