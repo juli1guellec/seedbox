@@ -293,7 +293,7 @@ def extract_torrent_features(name, size_gb, tags=""):
     n = name or ""
     n_low = n.lower()
     t_low = (tags or "").lower()
-    is_fl = "freeleech" in t_low
+    is_fl = any(k in t_low for k in ("freeleech", "cross-seed", "g3mini-bridge"))
 
     # 1. Classification du type de contenu
     if n_low.endswith(".ts") or "_france " in n_low or "_arte_" in n_low:
