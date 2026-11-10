@@ -927,17 +927,17 @@ def inject_c411_cross_seed_from_existing(existing_torrent, c411_dl_url, c411_tit
 def run_cross_seed_and_vip_bridge(torrents, now_ts):
     """
     Exécuté toutes les 15 minutes (0 impact supplémentaire sur YGGreborn) :
-    1. Compare les sorties locales Autobrr (/api/release) entre YGG/G3MINI et C411 au byte près.
+    1. Récupère les 50 dernières sorties C411 (1 requête / 15 min) + cache Autobrr.
     2. Tout torrent déjà à 100% sur le disque (YGG normal ou G3MINI VIP) qui existe sur C411
        est automatiquement injecté en Cross-Seed sur C411 (recheck -> 100% -> seed, 0 Mo DL).
     3. Pont VIP G3MINI -> C411 : si une nouveauté (300 Mo - 15 Go) sort simultanément sur
        G3MINI (statut VIP = DL illimité sans impact ratio) et C411, la télécharge via G3MINI
        pour la cross-seeder automatiquement à 100% sur C411 dès complétion.
     """
-    if not AUTOBRR_API_KEY or not C411_API_KEY:
+    if not C411_API_KEY:
         return
     try:
-        cs_state = {"checked_sizes": [], "bridged_sizes": []}
+        cs_state = {"checked_sizes": [], "bridged_sizes": [], "c411_urls": {}}
         if os.path.exists(CROSS_SEED_FILE):
             try:
                 with open(CROSS_SEED_FILE, "r", encoding="utf-8") as f:
@@ -946,6 +946,7 @@ def run_cross_seed_and_vip_bridge(torrents, now_ts):
                 pass
         checked_sizes = set(cs_state.get("checked_sizes", []))
         bridged_sizes = set(cs_state.get("bridged_sizes", []))
+        c411_urls = dict(cs_state.get("c411_urls", {}))
 
         # Indexer les torrents présents dans qBittorrent par taille exacte (octets)
         c411_sizes_in_qbit = set()
@@ -968,30 +969,35 @@ def run_cross_seed_and_vip_bridge(torrents, now_ts):
             if "g3mini-bridge" in tags and prog < 1.0:
                 active_bridge_dl += 1
 
-        # Lire les 200 dernières sorties dans la base locale Autobrr (0 requête vers les trackers)
-        rel_data = autobrr_request("/api/release?limit=200", "GET") or {}
-        rel_items = rel_data.get("data", []) if isinstance(rel_data, dict) else []
+        # 1. Lire le flux Torznab C411 des 50 dernières sorties (1 seule requête / 15 min)
+        c411_live_url = f"{C411_BASE_URL}/api?" + urllib.parse.urlencode({
+            "t": "search",
+            "apikey": C411_API_KEY,
+            "limit": "50",
+        })
+        req_c = urllib.request.Request(c411_live_url, headers={"User-Agent": USER_AGENT})
+        with urllib.request.urlopen(req_c, context=SSL_CTX, timeout=15) as resp_c:
+            root_c = ET.fromstring(resp_c.read().decode("utf-8", errors="replace"))
+        for it in root_c.findall(".//item"):
+            sz = int(it.findtext("size") or 0)
+            enc = it.find("enclosure")
+            if sz > 100_000_000 and enc is not None and enc.attrib.get("url"):
+                c411_urls[str(sz)] = {
+                    "url": enc.attrib["url"],
+                    "name": it.findtext("title") or "",
+                }
 
-        c411_rel_by_size = {}
-        for it in rel_items:
-            idx_id = (it.get("indexer", {}) or {}).get("identifier", "")
-            sz = int(it.get("size") or 0)
-            if idx_id == "rss-c411" and sz > 100_000_000:
-                c411_rel_by_size[sz] = it
-
-        # A. Cross-Seed Passif immédiat : Torrents déjà à 100% sur la Seedbox qui matchent C411 dans Autobrr
+        # A. Cross-Seed Passif immédiat : Torrents déjà à 100% sur la Seedbox (YGG ou G3MINI) qui matchent C411
         injected_count = 0
         for sz, src_t in list(completed_non_c411_by_size.items()):
             if sz in c411_sizes_in_qbit:
                 continue
-            if sz in c411_rel_by_size and injected_count < 2:
-                rel = c411_rel_by_size[sz]
-                dl_url = rel.get("download_url", "")
-                if dl_url and "c411.org/api" in dl_url:
-                    inject_c411_cross_seed_from_existing(src_t, dl_url, rel.get("name", ""))
-                    c411_sizes_in_qbit.add(sz)
-                    injected_count += 1
-                    time.sleep(2.0)
+            c_entry = c411_urls.get(str(sz))
+            if c_entry and c_entry.get("url") and injected_count < 2:
+                time.sleep(2.0)
+                inject_c411_cross_seed_from_existing(src_t, c_entry["url"], c_entry.get("name", ""))
+                c411_sizes_in_qbit.add(sz)
+                injected_count += 1
 
         # B. Vérification polie C411 Torznab (MAX 1 seul torrent nouvellement complété par cycle de 15 min)
         if injected_count == 0:
@@ -1008,6 +1014,7 @@ def run_cross_seed_and_vip_bridge(torrents, now_ts):
                     q_words.append(tok)
                 q = " ".join(q_words[:4])
                 if len(q) >= 3:
+                    time.sleep(2.5)
                     c411_url = f"{C411_BASE_URL}/api?" + urllib.parse.urlencode({
                         "t": "search",
                         "apikey": C411_API_KEY,
@@ -1021,7 +1028,7 @@ def run_cross_seed_and_vip_bridge(torrents, now_ts):
                         if int(it.findtext("size") or 0) == sz:
                             enc = it.find("enclosure")
                             if enc is not None and enc.attrib.get("url"):
-                                time.sleep(2.0)
+                                time.sleep(2.5)
                                 inject_c411_cross_seed_from_existing(src_t, enc.attrib["url"], it.findtext("title") or "")
                                 c411_sizes_in_qbit.add(sz)
                             break
@@ -1040,12 +1047,13 @@ def run_cross_seed_and_vip_bridge(torrents, now_ts):
                 sz = int(attr.get("size") or 0)
                 seeders = int(attr.get("seeders") or 0)
                 dl_link = attr.get("download_link")
+                c_entry = c411_urls.get(str(sz))
                 # Taille entre 300 Mo et 15 Go, au moins 1 seeder sur G3MINI, et présent à l'octet près sur C411
                 if (
                     300_000_000 <= sz <= 15_000_000_000
                     and seeders >= 1
                     and dl_link
-                    and sz in c411_rel_by_size
+                    and c_entry
                     and sz not in all_qbit_sizes
                     and sz not in bridged_sizes
                 ):
@@ -1057,14 +1065,20 @@ def run_cross_seed_and_vip_bridge(torrents, now_ts):
                     log_event(
                         "VIP_BRIDGE",
                         f"Pont VIP G3MINI -> C411 lancé : '{attr.get('name', '')[:50]}' ({round(sz / (1024**3), 2)} Go, 0 impact ratio)",
-                        {"size_bytes": sz, "c411_match": c411_rel_by_size[sz].get("name")},
+                        {"size_bytes": sz, "c411_match": c_entry.get("name")},
                     )
                     break  # Max 1 nouveau téléchargement pont VIP par cycle de 15 min
+
+        # Conserver uniquement les 300 dernières entrées c411_urls
+        if len(c411_urls) > 300:
+            keep_keys = list(c411_urls.keys())[-300:]
+            c411_urls = {k: c411_urls[k] for k in keep_keys}
 
         with open(CROSS_SEED_FILE, "w", encoding="utf-8") as f:
             json.dump({
                 "checked_sizes": list(checked_sizes)[-500:],
                 "bridged_sizes": list(bridged_sizes)[-500:],
+                "c411_urls": c411_urls,
                 "updated_iso": now_paris_iso(),
             }, f)
     except Exception as e:
