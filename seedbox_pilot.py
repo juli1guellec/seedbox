@@ -777,14 +777,22 @@ def poll_c411_account():
             data = json.loads(resp.read().decode("utf-8"))
         up_total = float(data.get("transfer", {}).get("uploaded", {}).get("total", 0))
         dl_total = float(data.get("transfer", {}).get("downloaded", {}).get("total", 0))
-        ratio = round(up_total / dl_total, 2) if dl_total > 0 else 99.0
+        ratio = round(up_total / dl_total, 4) if dl_total > 0 else 99.0
+        ratio_pct = round((up_total / dl_total) * 100.0, 2) if dl_total > 0 else 100.0
+        missing_upload_gb = round(max(0.0, (0.8 * dl_total - up_total) / (1024 ** 3)), 2)
+        margin_gb = round(((up_total / 0.8) - dl_total) / (1024 ** 3), 2)
         dl_info = data.get("download", {})
         STATE["trackers"]["c411"].update({
             "status": "ok",
             "ratio": ratio,
+            "ratio_pct": ratio_pct,
             "uploaded_gb": round(up_total / (1024 ** 3), 2),
             "downloaded_gb": round(dl_total / (1024 ** 3), 2),
+            "missing_upload_gb": missing_upload_gb,
+            "margin_gb": margin_gb,
             "zen_balance": data.get("zen", {}).get("balance"),
+            "level": data.get("level", {}).get("level"),
+            "user_class": data.get("class", {}).get("slug"),
             "download_allowed": dl_info.get("allowed", True),
             "blocked_reason": dl_info.get("blockedReason"),
             "last_check_iso": now_paris_iso(),
@@ -1659,12 +1667,13 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     </div>
 
     <div class="card">
-      <h2>🟣 C411 (Seed & Zen Recovery)</h2>
+      <h2>🟣 C411 (Compte API & Cross-Seed)</h2>
       <div class="big-val" id="c411-ratio" style="color:var(--violet)">--</div>
+      <div class="metric-row"><span>Compte (UP / DL)</span><strong id="c411-acct">--</strong></div>
+      <div class="metric-row"><span>Objectif Déblocage (80%)</span><strong id="c411-missing" style="color:var(--emerald)">--</strong></div>
+      <div class="metric-row"><span>Solde Zen & Statut DL</span><strong id="c411-zen" style="color:var(--sky)">--</strong></div>
       <div class="metric-row"><span>Torrents en Seed (Seedbox)</span><strong id="c411-seeds">--</strong></div>
-      <div class="metric-row"><span>Upload Seedbox actif</span><strong id="c411-up">--</strong></div>
-      <div class="metric-row"><span>Download Seedbox actif</span><strong id="c411-dl">--</strong></div>
-      <div class="metric-row"><span>Règle Anti-H&R appliquée</span><strong>74h Seed ou Ratio ≥ 2.1</strong></div>
+      <div class="metric-row"><span>Upload / DL Seedbox</span><strong id="c411-up">--</strong></div>
       <div class="metric-row"><span>Mode Pilote C411</span><strong id="c411-mode" style="color:var(--amber)">--</strong></div>
     </div>
 
@@ -1748,14 +1757,23 @@ async function loadStatus() {
     document.getElementById('ygg-ts').textContent = ygg.last_check_iso || '--';
 
     const c411 = s.trackers.c411 || {};
-    const c411Ratio = c411.ratio || c411.qbit_ratio || 0;
-    document.getElementById('c411-ratio').textContent = 'Ratio Seed ' + c411Ratio;
+    const c411Pct = c411.ratio_pct ? (' (' + c411.ratio_pct + '%)') : '';
+    document.getElementById('c411-ratio').textContent =
+      c411.ratio ? ('Ratio ' + c411.ratio + c411Pct) : ('Ratio Seed ' + (c411.qbit_ratio || 0));
+    document.getElementById('c411-acct').textContent =
+      (c411.uploaded_gb ?? '--') + ' Gio UP / ' + (c411.downloaded_gb ?? '--') + ' Gio DL';
+    document.getElementById('c411-missing').textContent =
+      (c411.missing_upload_gb > 0)
+        ? ('Reste ' + c411.missing_upload_gb + ' Gio UP avant déblocage')
+        : ('✅ Débloqué (Marge +' + (c411.margin_gb || 0) + ' Gio)');
+    document.getElementById('c411-zen').textContent =
+      (c411.zen_balance ?? '--') + ' Zen • ' + (c411.download_allowed ? '🟢 DL Autorisé' : '🟠 DL Bloqué (<80%)');
     document.getElementById('c411-seeds').textContent =
       (c411.active_seeds_qbit || 0) + ' torrents (dont ' + (c411.cross_seeded_count || 0) + ' Cross-Seeds 0 Mo DL)';
-    document.getElementById('c411-up').textContent = (c411.qbit_up_gb || 0) + ' Go';
-    document.getElementById('c411-dl').textContent = (c411.qbit_dl_gb || 0) + ' Go';
+    document.getElementById('c411-up').textContent =
+      (c411.qbit_up_gb || 0) + ' Go UP / ' + (c411.qbit_dl_gb || 0) + ' Go DL (Seedbox ' + (c411.qbit_ratio || 0) + ')';
     document.getElementById('c411-mode').textContent =
-      c411.download_allowed ? 'Nominal (2026 + Freeleech)' : 'Cross-Seed YGG/G3MINI VIP (0 Mo DL) + Zen';
+      c411.download_allowed ? 'Nominal (Freeleech + Cross-Seed)' : 'Cross-Seed YGG/G3MINI VIP (0 Mo DL) + Zen';
 
     const q = s.quota || {};
     document.getElementById('disk-pct').textContent = (q.used_pct || 0) + ' %';
