@@ -34,6 +34,7 @@ Fonctionnalités principales :
 
 import base64
 import datetime
+import hashlib
 import http.cookiejar
 import http.server
 import json
@@ -45,6 +46,8 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
+import xml.etree.ElementTree as ET
 from zoneinfo import ZoneInfo
 
 TZ_PARIS = ZoneInfo(os.environ.get("TZ", "Europe/Paris"))
@@ -92,6 +95,10 @@ YGG_PASS = os.environ.get("YGG_PASS", "")
 C411_BASE_URL = os.environ.get("C411_BASE_URL", "https://c411.org").rstrip("/")
 C411_API_KEY = os.environ.get("C411_API_KEY", "")
 
+G3MINI_BASE_URL = os.environ.get("G3MINI_BASE_URL", "https://gemini-tracker.org").rstrip("/")
+G3MINI_API_TOKEN = os.environ.get("G3MINI_API_TOKEN", "")
+CROSS_SEED_INTERVAL_SEC = int(os.environ.get("CROSS_SEED_INTERVAL_SEC", "900"))  # 15 min
+
 # ─── Paramètres de Stratégie & Seuils ────────────────────────────────────────
 PILOT_INTERVAL_SEC = int(os.environ.get("PILOT_INTERVAL_SEC", "300"))          # 5 min
 TRACKER_POLL_INTERVAL_SEC = int(os.environ.get("TRACKER_POLL_INTERVAL_SEC", "1800"))  # 30 min (Anti-ban strict)
@@ -130,6 +137,7 @@ HISTORY_FILE = os.path.join(DATA_DIR, "stats_history.jsonl")
 TELEMETRY_FILE = os.path.join(DATA_DIR, "telemetry.jsonl")
 LEDGER_FILE = os.path.join(DATA_DIR, "torrent_ledger.json")
 LEARNING_FILE = os.path.join(DATA_DIR, "learning_state.json")
+CROSS_SEED_FILE = os.path.join(DATA_DIR, "cross_seed_state.json")
 YGG_COOKIE_FILE = os.path.join(DATA_DIR, "ygg_cookies.txt")
 RETENTION_DAYS = int(os.environ.get("RETENTION_DAYS", "30"))
 UNREPAID_DEBT_BRAKE_GB = float(os.environ.get("UNREPAID_DEBT_BRAKE_GB", "12.0"))
@@ -145,6 +153,7 @@ STATE = {
     "last_pilot_iso": None,
     "last_tracker_ts": 0,
     "last_tracker_iso": None,
+    "last_cross_seed_ts": 0,
     "last_retention_ts": 0,
     "last_error": None,
     "logs_retention": {
@@ -192,9 +201,18 @@ STATE = {
             "download_allowed": None,
             "blocked_reason": None,
             "active_seeds_qbit": 0,
+            "cross_seeded_count": 0,
             "qbit_up_gb": 0.0,
             "qbit_dl_gb": 0.0,
             "qbit_ratio": 0.0,
+            "last_check_iso": None,
+        },
+        "g3mini": {
+            "status": "vip_bridge_ready",
+            "user_class": "VIP (DL Illimité)",
+            "active_seeds_qbit": 0,
+            "qbit_up_gb": 0.0,
+            "qbit_dl_gb": 0.0,
             "last_check_iso": None,
         },
     },
@@ -782,6 +800,277 @@ def poll_c411_account():
         STATE["trackers"]["c411"]["status"] = f"error: {e}"
 
 
+# ─── Moteur de Cross-Seed & Pont VIP (G3MINI / YGG -> C411, 0 impact YGG) ────
+def bdecode(data, idx=0):
+    c = chr(data[idx])
+    if c == "i":
+        end = data.index(b"e", idx)
+        return int(data[idx + 1 : end]), end + 1
+    elif c == "l":
+        idx += 1
+        res = []
+        while chr(data[idx]) != "e":
+            val, idx = bdecode(data, idx)
+            res.append(val)
+        return res, idx + 1
+    elif c == "d":
+        idx += 1
+        res = {}
+        while chr(data[idx]) != "e":
+            k, idx = bdecode(data, idx)
+            v, idx = bdecode(data, idx)
+            res[k] = v
+        return res, idx + 1
+    else:
+        colon = data.index(b":", idx)
+        length = int(data[idx:colon])
+        start = colon + 1
+        return data[start : start + length], start + length
+
+
+def bencode(val):
+    if isinstance(val, int):
+        return f"i{val}e".encode("ascii")
+    elif isinstance(val, bytes):
+        return f"{len(val)}:".encode("ascii") + val
+    elif isinstance(val, list):
+        return b"l" + b"".join(bencode(x) for x in val) + b"e"
+    elif isinstance(val, dict):
+        items = sorted(val.items(), key=lambda kv: kv[0])
+        return b"d" + b"".join(bencode(k) + bencode(v) for k, v in items) + b"e"
+    return b""
+
+
+def qbit_upload_torrent_bytes(raw_torrent, save_path="/home/apone/downloads/qbittorrent/", paused=True, tags="cross-seed"):
+    if not QBIT._logged_in:
+        QBIT.login()
+    boundary = "----WebKitFormBoundary" + uuid.uuid4().hex
+    parts = []
+
+    def _add_field(name, val):
+        parts.append(
+            f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n{val}\r\n'.encode("utf-8")
+        )
+
+    _add_field("paused", "true" if paused else "false")
+    _add_field("stopped", "true" if paused else "false")
+    if save_path:
+        _add_field("savepath", save_path)
+    if tags:
+        _add_field("tags", tags)
+    parts.append(
+        f'--{boundary}\r\nContent-Disposition: form-data; name="torrents"; filename="seed.torrent"\r\n'
+        f"Content-Type: application/x-bittorrent\r\n\r\n".encode("utf-8")
+        + raw_torrent
+        + b"\r\n"
+    )
+    parts.append(f"--{boundary}--\r\n".encode("utf-8"))
+    body = b"".join(parts)
+
+    req = urllib.request.Request(
+        f"{QBIT_URL}/api/v2/torrents/add",
+        data=body,
+        headers={
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+            "Referer": f"{QBIT_URL}/",
+            "User-Agent": USER_AGENT,
+        },
+    )
+    with QBIT.opener.open(req, timeout=15) as resp:
+        return resp.read().decode("utf-8", errors="replace")
+
+
+def inject_c411_cross_seed_from_existing(existing_torrent, c411_dl_url, c411_title=""):
+    """
+    Télécharge le .torrent C411, l'ajoute en mode PAUSED dans qBittorrent,
+    aligne les chemins de fichiers avec le torrent existant (100% sur disque),
+    puis lance un recheck local afin que la 1ère annonce à C411 soit à 100% (left=0).
+    """
+    req = urllib.request.Request(c411_dl_url, headers={"User-Agent": USER_AGENT})
+    with urllib.request.urlopen(req, context=SSL_CTX, timeout=15) as resp:
+        raw_t = resp.read()
+    t_dict, _ = bdecode(raw_t)
+    info = t_dict.get(b"info")
+    if not info:
+        return None
+    info_hash = hashlib.sha1(bencode(info)).hexdigest().lower()
+
+    ehash = existing_torrent["hash"]
+    save_path = existing_torrent.get("save_path") or "/home/apone/downloads/qbittorrent/"
+    efiles = QBIT.request(f"/api/v2/torrents/files?hash={ehash}") or []
+
+    qbit_upload_torrent_bytes(raw_t, save_path=save_path, paused=True, tags="cross-seed")
+    time.sleep(1.2)
+
+    nfiles = QBIT.request(f"/api/v2/torrents/files?hash={info_hash}") or []
+    if len(efiles) == 1 and len(nfiles) == 1:
+        old_p = nfiles[0]["name"]
+        new_p = efiles[0]["name"]
+        if old_p != new_p:
+            QBIT.request("/api/v2/torrents/renameFile", {"hash": info_hash, "oldPath": old_p, "newPath": new_p})
+    elif len(efiles) == len(nfiles) and len(efiles) > 1:
+        e_by_sz = {f["size"]: f["name"] for f in efiles}
+        for nf in nfiles:
+            target_p = e_by_sz.get(nf["size"])
+            if target_p and nf["name"] != target_p:
+                QBIT.request("/api/v2/torrents/renameFile", {"hash": info_hash, "oldPath": nf["name"], "newPath": target_p})
+
+    QBIT.request("/api/v2/torrents/recheck", {"hashes": info_hash})
+    log_event(
+        "CROSS_SEED",
+        f"Cross-Seed C411 injecté en recheck (0 Mo DL) : '{c411_title or existing_torrent.get('name', '')[:50]}'",
+        {"c411_hash": info_hash, "source_hash": ehash, "size_bytes": existing_torrent.get("size")},
+    )
+    return info_hash
+
+
+def run_cross_seed_and_vip_bridge(torrents, now_ts):
+    """
+    Exécuté toutes les 15 minutes (0 impact supplémentaire sur YGGreborn) :
+    1. Compare les sorties locales Autobrr (/api/release) entre YGG/G3MINI et C411 au byte près.
+    2. Tout torrent déjà à 100% sur le disque (YGG normal ou G3MINI VIP) qui existe sur C411
+       est automatiquement injecté en Cross-Seed sur C411 (recheck -> 100% -> seed, 0 Mo DL).
+    3. Pont VIP G3MINI -> C411 : si une nouveauté (300 Mo - 15 Go) sort simultanément sur
+       G3MINI (statut VIP = DL illimité sans impact ratio) et C411, la télécharge via G3MINI
+       pour la cross-seeder automatiquement à 100% sur C411 dès complétion.
+    """
+    if not AUTOBRR_API_KEY or not C411_API_KEY:
+        return
+    try:
+        cs_state = {"checked_sizes": [], "bridged_sizes": []}
+        if os.path.exists(CROSS_SEED_FILE):
+            try:
+                with open(CROSS_SEED_FILE, "r", encoding="utf-8") as f:
+                    cs_state.update(json.load(f))
+            except Exception:
+                pass
+        checked_sizes = set(cs_state.get("checked_sizes", []))
+        bridged_sizes = set(cs_state.get("bridged_sizes", []))
+
+        # Indexer les torrents présents dans qBittorrent par taille exacte (octets)
+        c411_sizes_in_qbit = set()
+        completed_non_c411_by_size = {}
+        all_qbit_sizes = set()
+        active_bridge_dl = 0
+
+        for t in torrents:
+            sz = int(t.get("size") or 0)
+            if sz <= 0:
+                continue
+            all_qbit_sizes.add(sz)
+            tags = t.get("tags", "")
+            tr = (t.get("tracker") or "").lower()
+            prog = float(t.get("progress", 0.0))
+            if "c411" in tr or "cross-seed" in tags:
+                c411_sizes_in_qbit.add(sz)
+            elif prog >= 1.0:
+                completed_non_c411_by_size[sz] = t
+            if "g3mini-bridge" in tags and prog < 1.0:
+                active_bridge_dl += 1
+
+        # Lire les 200 dernières sorties dans la base locale Autobrr (0 requête vers les trackers)
+        rel_data = autobrr_request("/api/release?limit=200", "GET") or {}
+        rel_items = rel_data.get("data", []) if isinstance(rel_data, dict) else []
+
+        c411_rel_by_size = {}
+        for it in rel_items:
+            idx_id = (it.get("indexer", {}) or {}).get("identifier", "")
+            sz = int(it.get("size") or 0)
+            if idx_id == "rss-c411" and sz > 100_000_000:
+                c411_rel_by_size[sz] = it
+
+        # A. Cross-Seed Passif immédiat : Torrents déjà à 100% sur la Seedbox qui matchent C411 dans Autobrr
+        injected_count = 0
+        for sz, src_t in list(completed_non_c411_by_size.items()):
+            if sz in c411_sizes_in_qbit:
+                continue
+            if sz in c411_rel_by_size and injected_count < 2:
+                rel = c411_rel_by_size[sz]
+                dl_url = rel.get("download_url", "")
+                if dl_url and "c411.org/api" in dl_url:
+                    inject_c411_cross_seed_from_existing(src_t, dl_url, rel.get("name", ""))
+                    c411_sizes_in_qbit.add(sz)
+                    injected_count += 1
+                    time.sleep(2.0)
+
+        # B. Vérification polie C411 Torznab (MAX 1 seul torrent nouvellement complété par cycle de 15 min)
+        if injected_count == 0:
+            for sz, src_t in list(completed_non_c411_by_size.items()):
+                if sz in c411_sizes_in_qbit or sz in checked_sizes:
+                    continue
+                checked_sizes.add(sz)
+                clean = re.sub(r"\.(mkv|mp4|avi|ts)$", "", src_t.get("name", ""), flags=re.I)
+                tokens = re.split(r"[._\s-]+", clean)
+                q_words = []
+                for tok in tokens:
+                    if re.match(r"^(1080p|2160p|multi|french|vff|vfq|vfi|truefrench|web|webrip|bluray|custom|s\d+e\d+|s\d+)$", tok, re.I):
+                        break
+                    q_words.append(tok)
+                q = " ".join(q_words[:4])
+                if len(q) >= 3:
+                    c411_url = f"{C411_BASE_URL}/api?" + urllib.parse.urlencode({
+                        "t": "search",
+                        "apikey": C411_API_KEY,
+                        "q": q,
+                        "limit": "30",
+                    })
+                    req = urllib.request.Request(c411_url, headers={"User-Agent": USER_AGENT})
+                    with urllib.request.urlopen(req, context=SSL_CTX, timeout=15) as resp:
+                        root = ET.fromstring(resp.read().decode("utf-8", errors="replace"))
+                    for it in root.findall(".//item"):
+                        if int(it.findtext("size") or 0) == sz:
+                            enc = it.find("enclosure")
+                            if enc is not None and enc.attrib.get("url"):
+                                time.sleep(2.0)
+                                inject_c411_cross_seed_from_existing(src_t, enc.attrib["url"], it.findtext("title") or "")
+                                c411_sizes_in_qbit.add(sz)
+                            break
+                break  # Strictement 1 seule recherche par cycle de 15 min (Anti-ban)
+
+        # C. Pont Actif VIP G3MINI -> C411 (0 impact YGGreborn, 0 impact G3MINI VIP, 0 Mo DL C411)
+        if G3MINI_API_TOKEN and active_bridge_dl < 2 and STATE["quota"]["used_pct"] < 80.0:
+            req_g = urllib.request.Request(
+                f"{G3MINI_BASE_URL}/api/torrents?api_token={G3MINI_API_TOKEN}&perPage=25",
+                headers={"User-Agent": USER_AGENT, "Accept": "application/json"},
+            )
+            with urllib.request.urlopen(req_g, context=SSL_CTX, timeout=15) as resp:
+                g_data = json.loads(resp.read().decode("utf-8", errors="replace"))
+            for it in g_data.get("data", []):
+                attr = it.get("attributes", {})
+                sz = int(attr.get("size") or 0)
+                seeders = int(attr.get("seeders") or 0)
+                dl_link = attr.get("download_link")
+                # Taille entre 300 Mo et 15 Go, au moins 1 seeder sur G3MINI, et présent à l'octet près sur C411
+                if (
+                    300_000_000 <= sz <= 15_000_000_000
+                    and seeders >= 1
+                    and dl_link
+                    and sz in c411_rel_by_size
+                    and sz not in all_qbit_sizes
+                    and sz not in bridged_sizes
+                ):
+                    req_gt = urllib.request.Request(dl_link, headers={"User-Agent": USER_AGENT})
+                    with urllib.request.urlopen(req_gt, context=SSL_CTX, timeout=15) as resp_gt:
+                        raw_gt = resp_gt.read()
+                    qbit_upload_torrent_bytes(raw_gt, paused=False, tags="g3mini-bridge")
+                    bridged_sizes.add(sz)
+                    log_event(
+                        "VIP_BRIDGE",
+                        f"Pont VIP G3MINI -> C411 lancé : '{attr.get('name', '')[:50]}' ({round(sz / (1024**3), 2)} Go, 0 impact ratio)",
+                        {"size_bytes": sz, "c411_match": c411_rel_by_size[sz].get("name")},
+                    )
+                    break  # Max 1 nouveau téléchargement pont VIP par cycle de 15 min
+
+        with open(CROSS_SEED_FILE, "w", encoding="utf-8") as f:
+            json.dump({
+                "checked_sizes": list(checked_sizes)[-500:],
+                "bridged_sizes": list(bridged_sizes)[-500:],
+                "updated_iso": now_paris_iso(),
+            }, f)
+    except Exception as e:
+        log_event("CROSS_SEED_WARN", f"Note cycle cross-seed : {e}")
+
+
 # ─── Moteur Principal de Pilotage (Cycle de 5 min) ───────────────────────────
 def classify_tracker(url):
     u = (url or "").lower()
@@ -789,6 +1078,8 @@ def classify_tracker(url):
         return "c411"
     if "yggreborn" in u:
         return "yggreborn"
+    if "gemini-tracker" in u:
+        return "g3mini"
     return "other"
 
 
@@ -858,6 +1149,8 @@ def run_pilot_cycle():
     fetch_ultra_quota(fallback_used_bytes=total_size_bytes)
 
     to_delete_hashes = []
+    to_delete_keep_files_hashes = []
+    to_resume_cross_seeds = []
     unlimited_hashes = []
     super_seed_enable = []
     super_seed_disable = []
@@ -866,7 +1159,14 @@ def run_pilot_cycle():
     by_tracker = {
         "yggreborn": {"count": 0, "size_gb": 0.0, "up_gb": 0.0, "dl_gb": 0.0},
         "c411": {"count": 0, "size_gb": 0.0, "up_gb": 0.0, "dl_gb": 0.0},
+        "g3mini": {"count": 0, "size_gb": 0.0, "up_gb": 0.0, "dl_gb": 0.0},
     }
+    size_counts = {}
+    for t in torrents:
+        sz_b = int(t.get("size") or 0)
+        if sz_b > 0:
+            size_counts[sz_b] = size_counts.get(sz_b, 0) + 1
+
     enriched_torrents = []
 
     for t in torrents:
@@ -874,8 +1174,17 @@ def run_pilot_cycle():
         name = t["name"]
         state = t["state"]
         prog = t.get("progress", 0.0)
+        tags = t.get("tags", "")
         added_on = t.get("added_on", now_ts)
         age_sec = max(0, now_ts - added_on)
+
+        # Démarrer automatiquement les Cross-Seeds C411 vérifiés à 100% (left=0 garanti)
+        if "cross-seed" in tags:
+            if prog >= 1.0 and ("paused" in state.lower() or "stopped" in state.lower()):
+                to_resume_cross_seeds.append((h, name))
+            elif prog < 1.0 and ("paused" in state.lower() or "stopped" in state.lower()) and "checking" not in state.lower() and age_sec >= 180:
+                to_delete_keep_files_hashes.append((h, name, f"Recheck cross-seed incomplet ({round(prog*100, 1)}%)"))
+                continue
 
         # Vérifier les trackers du torrent
         tr_list = QBIT.request(f"/api/v2/torrents/trackers?hash={h}") or []
@@ -908,14 +1217,20 @@ def run_pilot_cycle():
             c411_forbidden_dl_detected = True
 
         if state == "missingFiles":
-            to_delete_hashes.append((h, name, "Fichiers manquants (missingFiles)"))
+            to_delete_keep_files_hashes.append((h, name, "Fichiers manquants (missingFiles)"))
             continue
         if "removed from the tracker" in msgs and prog < 1.0:
-            to_delete_hashes.append((h, name, "Supprimé du tracker avant complétion"))
+            if size_counts.get(int(t.get("size") or 0), 1) > 1:
+                to_delete_keep_files_hashes.append((h, name, "Supprimé du tracker avant complétion (fichier partagé conservé)"))
+            else:
+                to_delete_hashes.append((h, name, "Supprimé du tracker avant complétion"))
             continue
         if state == "stalledDL" and prog == 0.0 and age_sec >= STALLED_FORBIDDEN_MAX_AGE_SEC:
             if "forbidden" in msgs or age_sec >= 86400:
-                to_delete_hashes.append((h, name, f"Bloqué à 0% ({msgs.strip() or 'stalled 24h'})"))
+                if size_counts.get(int(t.get("size") or 0), 1) > 1:
+                    to_delete_keep_files_hashes.append((h, name, f"Bloqué à 0% ({msgs.strip() or 'stalled 24h'})"))
+                else:
+                    to_delete_hashes.append((h, name, f"Bloqué à 0% ({msgs.strip() or 'stalled 24h'})"))
                 continue
 
         # S'assurer qu'aucune limite de ratio/temps ne coupe ce torrent
@@ -952,6 +1267,7 @@ def run_pilot_cycle():
             "state": state,
             "progress_pct": round(prog * 100.0, 1),
             "size_gb": round(t["size"] / (1024 ** 3), 2),
+            "size_bytes": int(t.get("size") or 0),
             "uploaded_gb": round(t["uploaded"] / (1024 ** 3), 2),
             "downloaded_gb": round(t["downloaded"] / (1024 ** 3), 2),
             "ratio": round(t.get("ratio", 0.0), 2),
@@ -963,11 +1279,28 @@ def run_pilot_cycle():
             "seeds": t.get("num_complete", 0),
             "leechs": leechs_cnt,
             "super_seeding": want_super,
-            "tags": t.get("tags", ""),
+            "tags": tags,
             "added_on": added_on,
         })
 
+    # Activer les Cross-Seeds C411 vérifiés à 100%
+    if to_resume_cross_seeds:
+        r_hashes = "|".join(x[0] for x in to_resume_cross_seeds)
+        for ep in ("/api/v2/torrents/resume", "/api/v2/torrents/start"):
+            try:
+                QBIT.request(ep, {"hashes": r_hashes})
+            except Exception:
+                pass
+        for h, nm in to_resume_cross_seeds:
+            log_event("CROSS_SEED_ACTIVE", f"Cross-Seed C411 100% vérifié et démarré en seed (0 Mo DL) : '{nm[:50]}'")
+
     # Appliquer les nettoyages et optimisations qBittorrent
+    if to_delete_keep_files_hashes:
+        hashes_str = "|".join(x[0] for x in to_delete_keep_files_hashes)
+        QBIT.request("/api/v2/torrents/delete", {"hashes": hashes_str, "deleteFiles": "false"})
+        for h, nm, reason in to_delete_keep_files_hashes:
+            log_event("CLEANUP", f"Retrait entrée torrent (fichiers conservés) '{nm[:50]}' : {reason}")
+
     if to_delete_hashes:
         hashes_str = "|".join(x[0] for x in to_delete_hashes)
         QBIT.request("/api/v2/torrents/delete", {"hashes": hashes_str, "deleteFiles": "true"})
@@ -995,20 +1328,32 @@ def run_pilot_cycle():
     # 2b. Exécuter le moteur d'Auto-Apprentissage & calcul du ROI par catégorie/taille/team
     learned = update_learning_engine(enriched_torrents, now_ts)
 
+    # 2c. Exécuter le moteur Cross-Seed & Pont VIP G3MINI -> C411 (toutes les 15 min)
+    if now_ts - STATE.get("last_cross_seed_ts", 0) >= CROSS_SEED_INTERVAL_SEC:
+        run_cross_seed_and_vip_bridge(torrents, now_ts)
+        STATE["last_cross_seed_ts"] = now_ts
+
     # 3. Garbage Collection Intelligent si le disque dépasse DISK_HIGH_WATERMARK_PCT (82%)
     used_pct = STATE["quota"]["used_pct"]
     if used_pct >= DISK_HIGH_WATERMARK_PCT:
         target_free_gb = (DISK_HIGH_WATERMARK_PCT - DISK_LOW_WATERMARK_PCT) / 100.0 * STATE["quota"]["limit_gb"]
         freed_gb = 0.0
+        # Ne jamais supprimer sur disque un fichier partagé avec un torrent C411 actif
+        c411_active_sizes = {x["size_bytes"] for x in enriched_torrents if x["tracker"] == "c411"}
         evict_candidates = [
             x for x in enriched_torrents
-            if x["hnr_safe"] and x["progress_pct"] >= 100.0 and x["up_speed_kb"] < 50.0
+            if x["hnr_safe"]
+            and x["progress_pct"] >= 100.0
+            and x["up_speed_kb"] < 50.0
+            and (x["tracker"] == "c411" or x["size_bytes"] not in c411_active_sizes)
         ]
         evict_candidates.sort(key=lambda x: x["score"])
         evicted_hashes = []
         for cand in evict_candidates:
             if freed_gb >= target_free_gb:
                 break
+            if size_counts.get(cand["size_bytes"], 1) > 1:
+                continue
             evicted_hashes.append(cand["hash"])
             freed_gb += cand["size_gb"]
             log_event(
@@ -1019,14 +1364,23 @@ def run_pilot_cycle():
         if evicted_hashes:
             QBIT.request("/api/v2/torrents/delete", {"hashes": "|".join(evicted_hashes), "deleteFiles": "true"})
 
-    # Mettre à jour les métriques C411 observées dans qBittorrent
+    # Mettre à jour les métriques C411 et G3MINI observées dans qBittorrent
     c411_qb = by_tracker["c411"]
     STATE["trackers"]["c411"]["active_seeds_qbit"] = c411_qb["count"]
+    STATE["trackers"]["c411"]["cross_seeded_count"] = sum(
+        1 for x in enriched_torrents if x["tracker"] == "c411" and "cross-seed" in x.get("tags", "")
+    )
     STATE["trackers"]["c411"]["qbit_up_gb"] = c411_qb["up_gb"]
     STATE["trackers"]["c411"]["qbit_dl_gb"] = c411_qb["dl_gb"]
     STATE["trackers"]["c411"]["qbit_ratio"] = (
         round(c411_qb["up_gb"] / c411_qb["dl_gb"], 2) if c411_qb["dl_gb"] > 0 else 0.0
     )
+
+    g3_qb = by_tracker["g3mini"]
+    STATE["trackers"]["g3mini"]["active_seeds_qbit"] = g3_qb["count"]
+    STATE["trackers"]["g3mini"]["qbit_up_gb"] = g3_qb["up_gb"]
+    STATE["trackers"]["g3mini"]["qbit_dl_gb"] = g3_qb["dl_gb"]
+    STATE["trackers"]["g3mini"]["last_check_iso"] = now_iso
 
     # 4. Surveillance Polie des Trackers (toutes les 30 minutes max)
     if now_ts - STATE["last_tracker_ts"] >= TRACKER_POLL_INTERVAL_SEC:
@@ -1050,7 +1404,17 @@ def run_pilot_cycle():
             debt_brake = learned.get("debt_brake_active", False)
             unrepaid_6h = learned.get("unrepaid_dl_debt_6h_gb", 0.0)
 
-            # Filtres Freeleech : toujours actifs sauf urgence disque (>92%)
+            c411_allowed = STATE["trackers"]["c411"].get("download_allowed")
+            c411_ratio = STATE["trackers"]["c411"].get("ratio")
+            # Tant que C411 bloque le téléchargement direct (Marge < 0 / ratio < 0.80),
+            # on pause aussi le filtre Freeleech direct C411 (#7) et on alimente C411
+            # à 100% par Cross-Seed (left=0, 0 Mo DL) depuis YGG normal et G3MINI VIP !
+            c411_direct_dl_ok = (
+                (not disk_emergency)
+                and (not c411_forbidden_dl_detected)
+                and (c411_allowed is True)
+            )
+
             set_autobrr_filter_enabled(
                 FILTER_ID_YGG_FREELEECH,
                 not disk_emergency,
@@ -1058,8 +1422,8 @@ def run_pilot_cycle():
             )
             set_autobrr_filter_enabled(
                 FILTER_ID_C411_FREELEECH,
-                not disk_emergency,
-                "Urgence disque >92%" if disk_emergency else "Freeleech C411 actif (0 risque ratio)",
+                c411_direct_dl_ok,
+                "C411 alimenté par Cross-Seed YGG/G3MINI (0 Mo DL)" if not c411_direct_dl_ok else "Freeleech C411 actif",
             )
 
             # Filtre YGG - 2026 Hits FR/MULTi : piloté par Ratio + Disque + Frein Anti-Dilution + Calibration Taille/Teams
@@ -1084,19 +1448,15 @@ def run_pilot_cycle():
             )
 
             # Filtre C411 - 2026 Hits FR/MULTi : actif uniquement si C411 autorise le DL, pas de 403 et dette 6h OK
-            c411_allowed = STATE["trackers"]["c411"].get("download_allowed")
-            c411_ratio = STATE["trackers"]["c411"].get("ratio")
             c411_paid_ok = (
-                (not disk_emergency)
-                and (not c411_forbidden_dl_detected)
-                and (c411_allowed is True)
+                c411_direct_dl_ok
                 and (c411_ratio is not None and c411_ratio >= C411_MIN_RATIO_FOR_PAID)
                 and (not debt_brake)
             )
             set_autobrr_filter_enabled(
                 FILTER_ID_C411_PAID,
                 c411_paid_ok,
-                "Récupération ratio C411 en cours (seed + Zen)" if not c411_paid_ok else f"Ratio C411={c411_ratio} OK",
+                "Récupération C411 via Cross-Seed + Zen (0 Mo DL)" if not c411_paid_ok else f"Ratio C411={c411_ratio} OK",
                 desired_max_size=adaptive_max_size,
                 desired_max_downloads=adaptive_max_dl,
                 desired_except_releases=adaptive_except,
@@ -1376,11 +1736,12 @@ async function loadStatus() {
     const c411 = s.trackers.c411 || {};
     const c411Ratio = c411.ratio || c411.qbit_ratio || 0;
     document.getElementById('c411-ratio').textContent = 'Ratio Seed ' + c411Ratio;
-    document.getElementById('c411-seeds').textContent = (c411.active_seeds_qbit || 0) + ' torrents en seed';
+    document.getElementById('c411-seeds').textContent =
+      (c411.active_seeds_qbit || 0) + ' torrents (dont ' + (c411.cross_seeded_count || 0) + ' Cross-Seeds 0 Mo DL)';
     document.getElementById('c411-up').textContent = (c411.qbit_up_gb || 0) + ' Go';
     document.getElementById('c411-dl').textContent = (c411.qbit_dl_gb || 0) + ' Go';
     document.getElementById('c411-mode').textContent =
-      c411.download_allowed ? 'Nominal (2026 + Freeleech)' : 'Seed & Zen Recovery + Freeleech';
+      c411.download_allowed ? 'Nominal (2026 + Freeleech)' : 'Cross-Seed YGG/G3MINI VIP (0 Mo DL) + Zen';
 
     const q = s.quota || {};
     document.getElementById('disk-pct').textContent = (q.used_pct || 0) + ' %';
@@ -1432,7 +1793,9 @@ async function loadStatus() {
     document.getElementById('torrents-tbody').innerHTML = torrents.map(t => {
       const trBadge = t.tracker === 'yggreborn'
         ? '<span class="badge badge-ok">YGG</span>'
-        : (t.tracker === 'c411' ? '<span class="badge badge-warn">C411</span>' : '<span class="badge">Autre</span>');
+        : (t.tracker === 'c411'
+            ? '<span class="badge badge-warn">C411' + ((t.tags || '').includes('cross-seed') ? ' ⚡CS' : '') + '</span>'
+            : (t.tracker === 'g3mini' ? '<span class="badge badge-ok">G3MINI VIP</span>' : '<span class="badge">Autre</span>'));
       const hnrBadge = t.hnr_safe
         ? '<span class="badge badge-ok">✅ H&R Validé</span>'
         : '<span class="badge badge-warn">⏳ Protégé (' + t.seed_hours + 'h/' + t.hnr_target_hours + 'h)</span>';
