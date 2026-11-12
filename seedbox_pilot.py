@@ -141,6 +141,7 @@ CROSS_SEED_FILE = os.path.join(DATA_DIR, "cross_seed_state.json")
 YGG_COOKIE_FILE = os.path.join(DATA_DIR, "ygg_cookies.txt")
 RETENTION_DAYS = int(os.environ.get("RETENTION_DAYS", "30"))
 UNREPAID_DEBT_BRAKE_GB = float(os.environ.get("UNREPAID_DEBT_BRAKE_GB", "12.0"))
+TRAFFIC_EXHAUST_LEAD_DAYS = float(os.environ.get("TRAFFIC_EXHAUST_LEAD_DAYS", "3.5"))  # Cibler 100% du quota 3,5j avant reset
 
 BASE_EXCEPT_RELEASES = (
     "*VOSTFR*,*SUBFRENCH*,*Fansub*,*CAM*,*TS*,*HDTS*,*DVDSCR*,"
@@ -168,6 +169,29 @@ STATE = {
         "limit_gb": 2000.0,
         "free_gb": 2000.0,
         "used_pct": 0.0,
+    },
+    "traffic_pacing": {
+        "traffic_avail_pct": 100.0,
+        "traffic_used_pct": 0.0,
+        "last_reset_iso": "2026-11-07T00:00:00",
+        "next_reset_iso": "2026-12-07T00:00:00",
+        "target_exhaustion_lead_days": TRAFFIC_EXHAUST_LEAD_DAYS,
+        "target_exhaustion_iso": "2026-12-03T12:00:00",
+        "cycle_total_days": 30.0,
+        "active_window_days": 26.5,
+        "elapsed_days": 0.0,
+        "days_until_reset": 30.0,
+        "days_until_target_exhaustion": 26.5,
+        "target_used_pct": 0.0,
+        "pacing_delta_pct": 0.0,
+        "current_burn_pct_per_day": 0.0,
+        "ideal_remaining_pct_per_day": 3.77,
+        "projected_exhaustion_days": 30.0,
+        "regime": "TRAJECTOIRE_IDEALE",
+        "qbit_up_limit_kb": 0,
+        "freeleech_max_dl": 3,
+        "paid_max_dl_bonus": 0,
+        "vip_bridge_max_active": 2,
     },
     "qbit": {
         "connected": False,
@@ -643,7 +667,113 @@ def set_autobrr_filter_enabled(
     return True
 
 
-# ─── Lecture du Quota Disque Ultra.cc ────────────────────────────────────────
+# ─── Lecture du Quota Disque & Lissage Mensuel du Trafic Ultra.cc ────────────
+def compute_monthly_traffic_pacing(q):
+    """
+    Calcule la trajectoire idéale de consommation du trafic mensuel Ultra.cc :
+    - Cible l'épuisement à 100 % du quota d'upload `TRAFFIC_EXHAUST_LEAD_DAYS` (3,5 jours)
+      avant la date de reset mensuel (`next_reset_iso`) pour garantir 0 % de trafic perdu.
+    - Ajuste en boucle fermée la limite globale d'upload qBittorrent (`qbit_up_limit_kb`)
+      et la cadence horaire des filtres Autobrr / Pont VIP G3MINI.
+    """
+    avail_pct = round(float(q.get("traffic_avail_pct", 100.0)), 2)
+    used_pct = round(max(0.0, 100.0 - avail_pct), 2)
+    last_iso = str(q.get("last_reset_iso") or "2026-11-07T00:00:00")
+    next_iso = str(q.get("next_reset_iso") or "2026-12-07T00:00:00")
+
+    now_dt = datetime.datetime.now()
+    try:
+        last_dt = datetime.datetime.fromisoformat(last_iso[:19])
+        next_dt = datetime.datetime.fromisoformat(next_iso[:19])
+    except Exception:
+        last_dt = datetime.datetime(now_dt.year, now_dt.month, 7, 0, 0, 0)
+        if now_dt < last_dt:
+            prev_m = 12 if now_dt.month == 1 else now_dt.month - 1
+            prev_y = now_dt.year - 1 if now_dt.month == 1 else now_dt.year
+            last_dt = datetime.datetime(prev_y, prev_m, 7, 0, 0, 0)
+        next_m = 1 if last_dt.month == 12 else last_dt.month + 1
+        next_y = last_dt.year + 1 if last_dt.month == 12 else last_dt.year
+        next_dt = datetime.datetime(next_y, next_m, 7, 0, 0, 0)
+
+    lead_days = TRAFFIC_EXHAUST_LEAD_DAYS
+    target_exhaust_dt = next_dt - datetime.timedelta(days=lead_days)
+    cycle_total_days = max(1.0, (next_dt - last_dt).total_seconds() / 86400.0)
+    active_window_days = max(1.0, cycle_total_days - lead_days)
+    elapsed_days = max(0.05, (now_dt - last_dt).total_seconds() / 86400.0)
+    days_until_reset = max(0.0, (next_dt - now_dt).total_seconds() / 86400.0)
+    days_until_target = max(0.0, (target_exhaust_dt - now_dt).total_seconds() / 86400.0)
+
+    target_used_pct = round(min(100.0, (elapsed_days / active_window_days) * 100.0), 2)
+    pacing_delta_pct = round(used_pct - target_used_pct, 2)
+    current_burn_pct_day = round(used_pct / elapsed_days, 2)
+    rem_window = days_until_target if days_until_target >= 0.5 else max(0.25, days_until_reset)
+    ideal_rem_pct_day = round(avail_pct / rem_window, 2)
+    projected_exhaust_days = round(avail_pct / max(0.1, current_burn_pct_day), 1)
+
+    # Sélection du régime de lissage mensuel
+    if days_until_reset <= 4.0 and avail_pct > 1.5:
+        regime = "SPRINT_FINAL_PRE_RESET"
+        qbit_up_limit_kb = 0
+        freeleech_max_dl = 5
+        paid_max_dl_bonus = 1
+        vip_bridge_max_active = 4
+    elif pacing_delta_pct <= -4.0:
+        regime = "RATTRAPAGE_BOOST"
+        qbit_up_limit_kb = 0
+        freeleech_max_dl = 4
+        paid_max_dl_bonus = 1
+        vip_bridge_max_active = 3
+    elif pacing_delta_pct <= 5.0:
+        regime = "TRAJECTOIRE_IDEALE"
+        qbit_up_limit_kb = 0
+        freeleech_max_dl = 3
+        paid_max_dl_bonus = 0
+        vip_bridge_max_active = 2
+    elif pacing_delta_pct <= 12.0:
+        regime = "LISSAGE_DOUX"
+        qbit_up_limit_kb = 1800
+        freeleech_max_dl = 2
+        paid_max_dl_bonus = -1
+        vip_bridge_max_active = 1
+    elif pacing_delta_pct <= 22.0:
+        regime = "LISSAGE_ACTIF_ANTI_EPUISEMENT"
+        qbit_up_limit_kb = 1100
+        freeleech_max_dl = 1
+        paid_max_dl_bonus = -1
+        vip_bridge_max_active = 1
+    else:
+        regime = "ECONOMIE_FORTE"
+        qbit_up_limit_kb = 750
+        freeleech_max_dl = 1
+        paid_max_dl_bonus = -1
+        vip_bridge_max_active = 1
+
+    STATE["traffic_pacing"] = {
+        "traffic_avail_pct": avail_pct,
+        "traffic_used_pct": used_pct,
+        "last_reset_iso": last_dt.strftime("%Y-%m-%dT%H:%M:%S"),
+        "next_reset_iso": next_dt.strftime("%Y-%m-%dT%H:%M:%S"),
+        "target_exhaustion_lead_days": lead_days,
+        "target_exhaustion_iso": target_exhaust_dt.strftime("%Y-%m-%dT%H:%M:%S"),
+        "cycle_total_days": round(cycle_total_days, 2),
+        "active_window_days": round(active_window_days, 2),
+        "elapsed_days": round(elapsed_days, 2),
+        "days_until_reset": round(days_until_reset, 2),
+        "days_until_target_exhaustion": round(days_until_target, 2),
+        "target_used_pct": target_used_pct,
+        "pacing_delta_pct": pacing_delta_pct,
+        "current_burn_pct_per_day": current_burn_pct_day,
+        "ideal_remaining_pct_per_day": ideal_rem_pct_day,
+        "projected_exhaustion_days": projected_exhaust_days,
+        "regime": regime,
+        "qbit_up_limit_kb": qbit_up_limit_kb,
+        "freeleech_max_dl": freeleech_max_dl,
+        "paid_max_dl_bonus": paid_max_dl_bonus,
+        "vip_bridge_max_active": vip_bridge_max_active,
+    }
+    return STATE["traffic_pacing"]
+
+
 def fetch_ultra_quota(fallback_used_bytes=0):
     try:
         auth_b64 = base64.b64encode(f"{SEEDBOX_USER}:{SEEDBOX_PASS}".encode("utf-8")).decode("ascii")
@@ -663,6 +793,7 @@ def fetch_ultra_quota(fallback_used_bytes=0):
             "free_gb": free_gb,
             "used_pct": used_pct,
         }
+        compute_monthly_traffic_pacing(q)
     except Exception:
         used_gb = round(fallback_used_bytes / (1024 ** 3), 2)
         limit_gb = 1863.0
@@ -672,6 +803,7 @@ def fetch_ultra_quota(fallback_used_bytes=0):
             "free_gb": round(max(0.0, limit_gb - used_gb), 2),
             "used_pct": round((used_gb / limit_gb) * 100.0, 2),
         }
+        compute_monthly_traffic_pacing(STATE.get("traffic_pacing", {}))
 
 
 # ─── Surveillance Polie des Trackers (Max 1 fois / 30 min) ───────────────────
@@ -1043,7 +1175,8 @@ def run_cross_seed_and_vip_bridge(torrents, now_ts):
                 break  # Strictement 1 seule recherche par cycle de 15 min (Anti-ban)
 
         # C. Pont Actif VIP G3MINI -> C411 (0 impact YGGreborn, 0 impact G3MINI VIP, 0 Mo DL C411)
-        if G3MINI_API_TOKEN and active_bridge_dl < 2 and STATE["quota"]["used_pct"] < 80.0:
+        max_vip_bridge = int(STATE.get("traffic_pacing", {}).get("vip_bridge_max_active", 2))
+        if G3MINI_API_TOKEN and active_bridge_dl < max_vip_bridge and STATE["quota"]["used_pct"] < 80.0:
             req_g = urllib.request.Request(
                 f"{G3MINI_BASE_URL}/api/torrents?api_token={G3MINI_API_TOKEN}&perPage=25",
                 headers={"User-Agent": USER_AGENT, "Accept": "application/json"},
@@ -1169,6 +1302,25 @@ def run_pilot_cycle():
 
     total_size_bytes = sum(t.get("size", 0) for t in torrents)
     fetch_ultra_quota(fallback_used_bytes=total_size_bytes)
+
+    # 2a. Appliquer le lissage mensuel du trafic sur la vitesse d'upload globale qBittorrent
+    pacing = STATE.get("traffic_pacing", {})
+    desired_up_kb = int(pacing.get("qbit_up_limit_kb", 0))
+    desired_up_bytes = desired_up_kb * 1024
+    current_up_bytes = int(tx.get("up_rate_limit", 0) or 0)
+    if abs(current_up_bytes - desired_up_bytes) >= 1024:
+        try:
+            QBIT.request("/api/v2/transfer/setUploadLimit", {"limit": desired_up_bytes})
+            lbl = "Illimité" if desired_up_kb == 0 else f"{desired_up_kb} Kio/s"
+            log_event(
+                "TRAFFIC_PACING",
+                f"Lissage trafic mensuel ({pacing.get('regime')}) : plafond upload qBittorrent réglé à {lbl} "
+                f"(Utilisé={pacing.get('traffic_used_pct')}% vs Cible J-{pacing.get('target_exhaustion_lead_days')}={pacing.get('target_used_pct')}%, "
+                f"Reset dans {pacing.get('days_until_reset')}j)",
+                pacing,
+            )
+        except Exception as e:
+            log_event("TRAFFIC_PACING_WARN", f"Erreur réglage limite upload : {e}")
 
     to_delete_hashes = []
     to_delete_keep_files_hashes = []
@@ -1422,7 +1574,10 @@ def run_pilot_cycle():
             extra_excepts = [f"*-{grp}*" for grp in learned.get("auto_blacklisted_groups", [])]
             adaptive_except = BASE_EXCEPT_RELEASES + ("," + ",".join(extra_excepts) if extra_excepts else "")
             adaptive_max_size = learned.get("recommended_max_size", "9GiB")
-            adaptive_max_dl = learned.get("recommended_max_downloads", 2)
+            base_max_dl = int(learned.get("recommended_max_downloads", 2))
+            fl_max_dl = int(pacing.get("freeleech_max_dl", 3))
+            paid_bonus = int(pacing.get("paid_max_dl_bonus", 0))
+            adaptive_max_dl = max(1, min(3, base_max_dl + paid_bonus))
             debt_brake = learned.get("debt_brake_active", False)
             unrepaid_6h = learned.get("unrepaid_dl_debt_6h_gb", 0.0)
 
@@ -1440,12 +1595,14 @@ def run_pilot_cycle():
             set_autobrr_filter_enabled(
                 FILTER_ID_YGG_FREELEECH,
                 not disk_emergency,
-                "Urgence disque >92%" if disk_emergency else "Freeleech YGG actif (0 risque ratio)",
+                "Urgence disque >92%" if disk_emergency else f"Freeleech YGG ({pacing.get('regime')}, {fl_max_dl}/h)",
+                desired_max_downloads=fl_max_dl,
             )
             set_autobrr_filter_enabled(
                 FILTER_ID_C411_FREELEECH,
                 c411_direct_dl_ok,
-                "C411 alimenté par Cross-Seed YGG/G3MINI (0 Mo DL)" if not c411_direct_dl_ok else "Freeleech C411 actif",
+                "C411 alimenté par Cross-Seed YGG/G3MINI (0 Mo DL)" if not c411_direct_dl_ok else f"Freeleech C411 ({pacing.get('regime')}, {fl_max_dl}/h)",
+                desired_max_downloads=fl_max_dl,
             )
 
             # Filtre YGG - 2026 Hits FR/MULTi : piloté par Ratio + Disque + Frein Anti-Dilution + Calibration Taille/Teams
@@ -1678,12 +1835,13 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     </div>
 
     <div class="card">
-      <h2>💾 Seedbox Ultra.cc (Spirit-v2)</h2>
+      <h2>💾 Seedbox Ultra.cc & Lissage Trafic Mensuel</h2>
       <div class="big-val" id="disk-pct" style="color:var(--sky)">--%</div>
       <div class="bar-bg"><div class="bar-fill" id="disk-bar" style="width:10%"></div></div>
       <div class="metric-row"><span>Espace Disque Utilisé</span><strong id="disk-used">--</strong></div>
-      <div class="metric-row"><span>Espace Disque Libre</span><strong id="disk-free">--</strong></div>
-      <div class="metric-row"><span>Seuil d'éviction intelligente</span><strong>82% (H&R-safe uniquement)</strong></div>
+      <div class="metric-row"><span>Trafic Mensuel Utilisé / Cible J-3,5</span><strong id="traffic-used" style="color:var(--amber)">--</strong></div>
+      <div class="metric-row"><span>Prochain Reset & Cible 100%</span><strong id="traffic-reset">--</strong></div>
+      <div class="metric-row"><span>Régime Lissage & Plafond Upload</span><strong id="traffic-regime" style="color:var(--emerald)">--</strong></div>
       <div class="metric-row"><span>Vitesse Upload / Download</span><strong id="speeds">--</strong></div>
     </div>
 
@@ -1776,10 +1934,17 @@ async function loadStatus() {
       c411.download_allowed ? 'Nominal (Freeleech + Cross-Seed)' : 'Cross-Seed YGG/G3MINI VIP (0 Mo DL) + Zen';
 
     const q = s.quota || {};
-    document.getElementById('disk-pct').textContent = (q.used_pct || 0) + ' %';
-    document.getElementById('disk-bar').style.width = Math.min(100, q.used_pct || 0) + '%';
-    document.getElementById('disk-used').textContent = (q.used_gb || 0) + ' / ' + (q.limit_gb || 2000) + ' Go';
-    document.getElementById('disk-free').textContent = (q.free_gb || 0) + ' Go';
+    const tp = s.traffic_pacing || {};
+    document.getElementById('disk-pct').textContent = 'Disque ' + (q.used_pct || 0) + '% • Trafic ' + (tp.traffic_used_pct ?? 0) + '%';
+    document.getElementById('disk-bar').style.width = Math.min(100, tp.traffic_used_pct || q.used_pct || 0) + '%';
+    document.getElementById('disk-used').textContent = (q.used_gb || 0) + ' / ' + (q.limit_gb || 1863) + ' Go (' + (q.free_gb || 0) + ' Go libres)';
+    const dSign = (tp.pacing_delta_pct || 0) >= 0 ? '+' : '';
+    document.getElementById('traffic-used').textContent =
+      (tp.traffic_used_pct ?? 0) + '% utilisé vs ' + (tp.target_used_pct ?? 0) + '% cible (' + dSign + (tp.pacing_delta_pct ?? 0) + '%)';
+    document.getElementById('traffic-reset').textContent =
+      'Reset ' + (tp.next_reset_iso || '').slice(0, 10) + ' (dans ' + (tp.days_until_reset ?? '--') + 'j • Cible 100% dans ' + (tp.days_until_target_exhaustion ?? '--') + 'j)';
+    const upLim = tp.qbit_up_limit_kb ? (tp.qbit_up_limit_kb + ' Kio/s') : 'Illimité';
+    document.getElementById('traffic-regime').textContent = (tp.regime || '--') + ' (' + upLim + ')';
     document.getElementById('speeds').textContent =
       '⬆️ ' + (s.qbit.up_speed_mb || 0) + ' Mo/s  |  ⬇️ ' + (s.qbit.dl_speed_mb || 0) + ' Mo/s';
 
