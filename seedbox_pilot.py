@@ -676,10 +676,15 @@ def compute_monthly_traffic_pacing(q):
     - Ajuste en boucle fermée la limite globale d'upload qBittorrent (`qbit_up_limit_kb`)
       et la cadence horaire des filtres Autobrr / Pont VIP G3MINI.
     """
-    avail_pct = round(float(q.get("traffic_avail_pct", 100.0)), 2)
+    prev_pacing = STATE.get("traffic_pacing", {})
+    raw_avail = q.get("traffic_avail_pct")
+    if raw_avail is None or (float(raw_avail) >= 99.9 and prev_pacing.get("traffic_avail_pct", 100.0) < 95.0):
+        avail_pct = round(float(prev_pacing.get("traffic_avail_pct", 100.0)), 2)
+    else:
+        avail_pct = round(float(raw_avail), 2)
     used_pct = round(max(0.0, 100.0 - avail_pct), 2)
-    last_iso = str(q.get("last_reset_iso") or "2026-11-07T00:00:00")
-    next_iso = str(q.get("next_reset_iso") or "2026-12-07T00:00:00")
+    last_iso = str(q.get("last_reset_iso") or prev_pacing.get("last_reset_iso") or "2026-11-07T00:00:00")
+    next_iso = str(q.get("next_reset_iso") or prev_pacing.get("next_reset_iso") or "2026-12-07T00:00:00")
 
     now_dt = datetime.datetime.now()
     try:
